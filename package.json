@@ -1,0 +1,24 @@
+{
+  "name": "blind-view",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Blind View — hear what the camera sees. An assistive live audio-description app.",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c cyan,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm run dev --workspace @blind-view/server",
+    "dev:web": "npm run dev --workspace @blind-view/web",
+    "build": "npm run build --workspace @blind-view/web",
+    "preview": "npm run preview --workspace @blind-view/web",
+    "start": "npm run start --workspace @blind-view/server",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Build output
+dist/
+dist-ssr/
+build/
+*.tsbuildinfo
+apps/web/dev-dist/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor / OS
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+
+# Native (Capacitor, added in a later phase)
+apps/web/ios/
+apps/web/android/
+
+# Cache
+.cache/
+.temp/
+coverage/
+
+# Generated binary assets (fetched by `npm run setup`, not committed)
+apps/web/public/models/
+apps/web/public/ort/

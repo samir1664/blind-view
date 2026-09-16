@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Blind View">
+  <rect width="512" height="512" rx="112" fill="#000000" />
+  <circle cx="256" cy="256" r="150" fill="none" stroke="#FFD400" stroke-width="26" />
+  <circle cx="256" cy="256" r="54" fill="#FFD400" />
+  <g stroke="#FFD400" stroke-width="22" stroke-linecap="round">
+    <path d="M256 66v42" />
+    <path d="M256 404v42" />
+    <path d="M66 256h42" />
+    <path d="M404 256h42" />
+  </g>
+</svg>

@@ -1,0 +1,339 @@
+import { serve } from '@hono/node-server';
+import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
+import { cors } from 'hono/cors';
+import { logger } from 'hono/logger';
+
+import { env, hasGeminiKey } from './env.js';
+import { GeminiError, generateDescription } from './gemini.js';
+import { classifyPlace } from './place.js';
+import type { PlaceContext } from './place.js';
+import { PLACE_CATEGORIES } from './playbooks.js';
+import type { Environment, PlaceCategory } from './playbooks.js';
+import { buildPrompt, MODES, VERBOSITIES } from './prompts.js';
+import type { Mode, Verbosity } from './prompts.js';
+import { checkRateLimit } from './rateLimit.js';
+
+const ALLOWED_MIME = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/** Private-network origins, so a phone on the same Wi-Fi can hit the dev server. */
+const LAN_ORIGIN_RE =
+  /^https?:\/\/(localhost|127\.0\.0\.1|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$/;
+
+const isProduction = process.env.NODE_ENV === 'production';
+
+const app = new Hono();
+
+app.use('*', logger());
+
+app.use(
+  '/api/*',
+  cors({
+    origin: (origin) => {
+      if (!origin) return origin; // same-origin / native shell
+      if (env.allowedOrigins.includes('*')) return origin;
+      if (env.allowedOrigins.includes(origin)) return origin;
+      if (!isProduction && LAN_ORIGIN_RE.test(origin)) return origin;
+      return null;
+    },
+    allowMethods: ['GET', 'POST', 'OPTIONS'],
+    allowHeaders: ['Content-Type'],
+    maxAge: 86_400,
+  }),
+);
+
+app.get('/api/health', (c) =>
+  c.json({
+    ok: true,
+    // Lets the client warn the user before they try to use narration.
+    visionConfigured: hasGeminiKey,
+    models: env.geminiModels,
+    uptimeSec: Math.round(process.uptime()),
+  }),
+);
+
+interface DescribeBody {
+  imageBase64?: unknown;
+  mimeType?: unknown;
+  mode?: unknown;
+  verbosity?: unknown;
+  query?: unknown;
+  recent?: unknown;
+  detections?: unknown;
+  place?: unknown;
+}
+
+/** Shared image validation for every endpoint that accepts a frame. */
+function parseImage(
+  raw: unknown,
+  mime: unknown,
+): { data: string; mimeType: string } | { error: string; status: 400 | 413 } {
+  if (typeof raw !== 'string' || raw.length === 0) {
+    return { error: 'Missing image.', status: 400 };
+  }
+  // Accept either a raw base64 payload or a full data: URL.
+  const data = raw.replace(/^data:[^;]+;base64,/, '').trim();
+  if (!BASE64_RE.test(data)) {
+    return { error: 'Image is not valid base64.', status: 400 };
+  }
+  if ((data.length * 3) / 4 / 1024 > env.maxImageKb) {
+    return { error: 'Image too large.', status: 413 };
+  }
+  return {
+    data,
+    mimeType:
+      typeof mime === 'string' && ALLOWED_MIME.has(mime) ? mime : 'image/jpeg',
+  };
+}
+
+/**
+ * The client echoes back the place context it already holds. It is untrusted
+ * input that lands in a prompt, so every field is re-validated and clamped
+ * rather than passed through.
+ */
+function parsePlace(value: unknown): PlaceContext | null {
+  if (!value || typeof value !== 'object') return null;
+  const candidate = value as Record<string, unknown>;
+
+  const category = candidate.category;
+  if (
+    typeof category !== 'string' ||
+    !PLACE_CATEGORIES.includes(category as PlaceCategory)
+  ) {
+    return null;
+  }
+
+  const clean = (input: unknown, max: number) =>
+    typeof input === 'string'
+      ? input.replace(/[^\p{L}\p{N} ,.'\-]/gu, '').slice(0, max)
+      : '';
+
+  const environment: Environment =
+    candidate.environment === 'indoor' ? 'indoor' : 'outdoor';
+  const place = clean(candidate.place, 40);
+  const confidence = Number(candidate.confidence);
+
+  return {
+    environment,
+    category: category as PlaceCategory,
+    place,
+    confidence: Number.isFinite(confidence)
+      ? Math.max(0, Math.min(1, confidence))
+      : 0.5,
+    announcement: clean(candidate.announcement, 140),
+    watchFor: Array.isArray(candidate.watchFor)
+      ? candidate.watchFor.slice(0, 3).map((w) => clean(w, 48)).filter(Boolean)
+      : [],
+    path: `${environment} > ${category} > ${place}`,
+  };
+}
+
+app.post(
+  '/api/describe',
+  bodyLimit({
+    maxSize: (env.maxImageKb + 64) * 1024,
+    onError: (c) => c.json({ error: 'Image too large.' }, 413),
+  }),
+  async (c) => {
+    if (!hasGeminiKey) {
+      return c.json(
+        {
+          error:
+            'Vision is not configured. Add GEMINI_API_KEY to your .env file and restart the server.',
+          code: 'NO_API_KEY',
+        },
+        503,
+      );
+    }
+
+    const clientKey =
+      c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
+      c.req.header('cf-connecting-ip') ||
+      'local';
+
+    const limit = checkRateLimit(clientKey, env.rateLimitPerMin);
+    if (!limit.allowed) {
+      c.header('Retry-After', String(limit.retryAfterSec));
+      return c.json(
+        { error: 'Too many requests. Slow down.', code: 'RATE_LIMITED' },
+        429,
+      );
+    }
+
+    let body: DescribeBody;
+    try {
+      body = await c.req.json<DescribeBody>();
+    } catch {
+      return c.json({ error: 'Malformed request body.' }, 400);
+    }
+
+    // ── Validate image ──────────────────────────────────────────
+    const image = parseImage(body.imageBase64, body.mimeType);
+    if ('error' in image) {
+      return c.json({ error: image.error }, image.status);
+    }
+
+    // ── Validate options ────────────────────────────────────────
+    const mode: Mode = MODES.includes(body.mode as Mode)
+      ? (body.mode as Mode)
+      : 'scene';
+
+    const verbosity: Verbosity = VERBOSITIES.includes(body.verbosity as Verbosity)
+      ? (body.verbosity as Verbosity)
+      : 'normal';
+
+    const query =
+      typeof body.query === 'string'
+        ? body.query.replace(/\s+/g, ' ').slice(0, 200).trim()
+        : undefined;
+
+    const recent = Array.isArray(body.recent)
+      ? body.recent
+          .filter((r): r is string => typeof r === 'string')
+          .slice(-4)
+          .map((r) => r.replace(/\s+/g, ' ').slice(0, 200))
+      : [];
+
+    const detections = Array.isArray(body.detections)
+      ? body.detections
+          .filter((d): d is string => typeof d === 'string')
+          .slice(0, 12)
+          .map((d) => d.replace(/[^a-z0-9 -]/gi, '').slice(0, 40))
+          .filter(Boolean)
+      : [];
+
+    const { system, user } = buildPrompt({
+      mode,
+      verbosity,
+      query,
+      recent,
+      detections,
+      place: parsePlace(body.place),
+    });
+
+    const startedAt = Date.now();
+    try {
+      const text = await generateDescription({
+        system,
+        user,
+        imageBase64: image.data,
+        mimeType: image.mimeType,
+        mode,
+        verbosity,
+      });
+
+      return c.json({
+        text,
+        mode,
+        latencyMs: Date.now() - startedAt,
+      });
+    } catch (error) {
+      if (error instanceof GeminiError) {
+        // Tell the client how long to stay quiet, so a quota error cannot
+        // become a retry storm.
+        if (error.status === 429 || error.status === 503) {
+          c.header('Retry-After', error.status === 429 ? '30' : '5');
+        }
+        return c.json(
+          { error: error.message, retryable: error.retryable },
+          error.status as 400,
+        );
+      }
+      console.error('[describe] unexpected failure', error);
+      return c.json({ error: 'Description failed.', retryable: true }, 500);
+    }
+  },
+);
+
+/**
+ * Identify where the user is, as a hierarchy: indoor > mall > escalator.
+ *
+ * Runs on a much slower cadence than /api/describe. The answer is reused
+ * across many narration turns to pick the right vocabulary and hazards.
+ */
+app.post(
+  '/api/place',
+  bodyLimit({
+    maxSize: (env.maxImageKb + 64) * 1024,
+    onError: (c) => c.json({ error: 'Image too large.' }, 413),
+  }),
+  async (c) => {
+    if (!hasGeminiKey) {
+      return c.json(
+        { error: 'Vision is not configured.', code: 'NO_API_KEY' },
+        503,
+      );
+    }
+
+    const clientKey =
+      c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
+      c.req.header('cf-connecting-ip') ||
+      'local';
+
+    const limit = checkRateLimit(clientKey, env.rateLimitPerMin);
+    if (!limit.allowed) {
+      c.header('Retry-After', String(limit.retryAfterSec));
+      return c.json({ error: 'Too many requests.', code: 'RATE_LIMITED' }, 429);
+    }
+
+    let body: DescribeBody;
+    try {
+      body = await c.req.json<DescribeBody>();
+    } catch {
+      return c.json({ error: 'Malformed request body.' }, 400);
+    }
+
+    const image = parseImage(body.imageBase64, body.mimeType);
+    if ('error' in image) {
+      return c.json({ error: image.error }, image.status);
+    }
+
+    const detections = Array.isArray(body.detections)
+      ? body.detections
+          .filter((d): d is string => typeof d === 'string')
+          .slice(0, 12)
+          .map((d) => d.replace(/[^a-z0-9 -]/gi, '').slice(0, 40))
+          .filter(Boolean)
+      : [];
+
+    const startedAt = Date.now();
+    try {
+      const place = await classifyPlace({
+        imageBase64: image.data,
+        mimeType: image.mimeType,
+        previous: parsePlace(body.place),
+        detections,
+      });
+      return c.json({ place, latencyMs: Date.now() - startedAt });
+    } catch (error) {
+      if (error instanceof GeminiError) {
+        if (error.status === 429 || error.status === 503) {
+          c.header('Retry-After', error.status === 429 ? '30' : '5');
+        }
+        return c.json(
+          { error: error.message, retryable: error.retryable },
+          error.status as 400,
+        );
+      }
+      console.error('[place] unexpected failure', error);
+      return c.json({ error: 'Place detection failed.', retryable: true }, 500);
+    }
+  },
+);
+
+app.notFound((c) => c.json({ error: 'Not found.' }, 404));
+
+serve({ fetch: app.fetch, port: env.port, hostname: '0.0.0.0' }, (info) => {
+  console.log(`\n  Blind View API  →  http://localhost:${info.port}`);
+  console.log(`  Models          →  ${env.geminiModels.join(' → ')}`);
+  if (hasGeminiKey) {
+    console.log('  Gemini key      →  loaded\n');
+  } else {
+    console.warn(
+      '\n  ⚠  GEMINI_API_KEY is missing.\n' +
+        '     On-device hazard alerts will still work, but scene narration will not.\n' +
+        '     Get a free key at https://aistudio.google.com/apikey and put it in .env\n',
+    );
+  }
+});
