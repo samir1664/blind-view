@@ -16,6 +16,7 @@
     "test": "npm test --workspace @blind-view/server",
     "deploy:api": "gcloud run deploy blind-view-api --source . --region asia-south1 --service-account blind-view-api@blind-view-ai.iam.gserviceaccount.com --min-instances 0 --max-instances 3 --memory 512Mi --allow-unauthenticated --set-env-vars \"^@^GOOGLE_CLOUD_PROJECT=blind-view-ai@VERTEX_LOCATION=global@GEMINI_MODEL=gemini-3.5-flash-lite,gemini-3.1-flash-lite@REQUIRE_APP_CHECK=true@ALLOWED_ORIGINS=https://blind-view-ai.web.app,https://blind-view-ai.firebaseapp.com\"",
     "deploy:api:preview": "npm run deploy:api -- --no-traffic --tag preview",
+    "deploy:web": "npm run build && firebase deploy --only hosting --project blind-view-ai",
     "typecheck": "npm run typecheck --workspaces --if-present"
   },
   "devDependencies": {
