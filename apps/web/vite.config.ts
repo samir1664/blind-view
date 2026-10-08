@@ -12,6 +12,9 @@ import { VitePWA } from 'vite-plugin-pwa';
 const useHttps = process.env.HTTPS === '1';
 
 export default defineConfig({
+  // One .env at the repo root feeds both apps. Vite only ever exposes
+  // VITE_-prefixed values to the browser, so server secrets stay server-side.
+  envDir: '../..',
   plugins: [
     react(),
     ...(useHttps ? [basicSsl()] : []),

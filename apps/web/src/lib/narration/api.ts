@@ -1,4 +1,5 @@
 import type { NarrationMode, PlaceContext, Verbosity } from '../../types';
+import { authHeaders } from '../firebase';
 import type { CapturedFrame } from '../vision/capture';
 
 /**
@@ -18,6 +19,12 @@ export class NarrationError extends Error {
     super(message);
     this.name = 'NarrationError';
   }
+}
+
+const SECURITY_FAILED = 'Security check failed. Reload the app.';
+
+async function jsonHeaders(): Promise<Record<string, string>> {
+  return { 'Content-Type': 'application/json', ...(await authHeaders()) };
 }
 
 export interface DescribeRequest {
@@ -55,7 +62,7 @@ export async function describeFrame({
   try {
     response = await fetch('/api/describe', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: await jsonHeaders(),
       body: JSON.stringify({
         imageBase64: frame.base64,
         mimeType: frame.mimeType,
@@ -82,6 +89,9 @@ export async function describeFrame({
   };
 
   if (!response.ok || !payload.text) {
+    if (response.status === 401) {
+      throw new NarrationError(SECURITY_FAILED, 401, false);
+    }
     throw new NarrationError(
       payload.error ?? 'Description failed.',
       response.status,
@@ -137,7 +147,7 @@ export async function classifyPlace({
   try {
     response = await fetch('/api/place', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: await jsonHeaders(),
       body: JSON.stringify({
         imageBase64: frame.base64,
         mimeType: frame.mimeType,
@@ -158,6 +168,9 @@ export async function classifyPlace({
   };
 
   if (!response.ok || !payload.place) {
+    if (response.status === 401) {
+      throw new NarrationError(SECURITY_FAILED, 401, false);
+    }
     throw new NarrationError(
       payload.error ?? 'Place detection failed.',
       response.status,
