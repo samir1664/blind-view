@@ -22,17 +22,39 @@ function num(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+export type Provider = 'vertex' | 'aistudio';
+
+/**
+ * Vertex AI is the default whenever a Google Cloud project is configured: it is
+ * covered by Cloud credits and has no per-day request cap. The AI Studio key
+ * remains as a zero-setup fallback for local development.
+ */
+export function resolveProvider(
+  raw: string | undefined,
+  project: string,
+): Provider {
+  const value = raw?.trim().toLowerCase();
+  if (value === 'vertex' || value === 'aistudio') return value;
+  return project ? 'vertex' : 'aistudio';
+}
+
+const gcpProject = (
+  process.env.GOOGLE_CLOUD_PROJECT ?? process.env.GCLOUD_PROJECT ?? ''
+).trim();
+
 export const env = {
+  provider: resolveProvider(process.env.GEMINI_PROVIDER, gcpProject),
+  gcpProject,
+  /** `global` gives the widest model availability for generateContent. */
+  vertexLocation: process.env.VERTEX_LOCATION?.trim() || 'global',
   geminiApiKey: process.env.GEMINI_API_KEY?.trim() ?? '',
   /**
-   * Models to try, in order. The free tier allows only ~20 requests per day
-   * *per model*, so listing more than one both multiplies the daily budget and
-   * keeps the app alive when a model is retired — which already happened once
-   * with gemini-2.5-flash.
+   * Models to try, in order. A model is skipped when it is retired (404) or
+   * out of quota (429), so listing more than one keeps narration alive.
    */
   geminiModels: (
     process.env.GEMINI_MODEL?.trim() ||
-    'gemini-flash-lite-latest,gemini-3.1-flash-lite'
+    'gemini-3.5-flash-lite,gemini-3.1-flash-lite'
   )
     .split(',')
     .map((model) => model.trim())
@@ -48,5 +70,3 @@ export const env = {
     .map((o) => o.trim())
     .filter(Boolean),
 };
-
-export const hasGeminiKey = env.geminiApiKey.length > 0;

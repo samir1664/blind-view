@@ -1,7 +1,6 @@
 import { env } from './env.js';
+import { authHeaders, endpointFor } from './provider.js';
 import type { Mode, Verbosity } from './prompts.js';
-
-const API_ROOT = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 /**
  * Upper bound on generated tokens.
@@ -89,20 +88,23 @@ async function callModel(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
+  let credentials: Record<string, string>;
+  try {
+    credentials = await authHeaders();
+  } catch (error) {
+    clearTimeout(timer);
+    console.error('[gemini] could not obtain credentials', error);
+    throw new GeminiError('Vision service is not authorised.', 503, false);
+  }
+
   let response: Response;
   try {
-    response = await fetch(
-      `${API_ROOT}/${encodeURIComponent(model)}:generateContent`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': env.geminiApiKey,
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      },
-    );
+    response = await fetch(endpointFor(model), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...credentials },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
   } catch (error) {
     if ((error as Error).name === 'AbortError') {
       throw new GeminiError('Vision request timed out.', 504, true);
@@ -119,12 +121,19 @@ async function callModel(
     if (response.status === 400 && /API key/i.test(detail)) {
       throw new GeminiError('Invalid GEMINI_API_KEY.', 401, false);
     }
+    if (response.status === 401 || response.status === 403) {
+      console.error(`[gemini] ${model} rejected credentials: ${detail}`);
+      throw new GeminiError('Vision service is not authorised.', 503, false);
+    }
     if (response.status === 404) {
+      console.warn(`[gemini] model ${model} is unavailable, trying next`);
       throw new GeminiError(`Model ${model} is unavailable.`, 404, false);
     }
     if (response.status === 429) {
       throw new GeminiError(
-        'Daily free-tier quota is used up. Enable billing or try tomorrow.',
+        env.provider === 'vertex'
+          ? 'The vision service is rate limited. Try again shortly.'
+          : 'Daily free-tier quota is used up. Enable billing or try tomorrow.',
         429,
         true,
       );

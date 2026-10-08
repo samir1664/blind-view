@@ -4,7 +4,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 
-import { env, hasGeminiKey } from './env.js';
+import { env } from './env.js';
 import { GeminiError, generateDescription } from './gemini.js';
 import { classifyPlace } from './place.js';
 import type { PlaceContext } from './place.js';
@@ -12,7 +12,10 @@ import { PLACE_CATEGORIES } from './playbooks.js';
 import type { Environment, PlaceCategory } from './playbooks.js';
 import { buildPrompt, MODES, VERBOSITIES } from './prompts.js';
 import type { Mode, Verbosity } from './prompts.js';
+import { isVisionConfigured } from './provider.js';
 import { checkRateLimit } from './rateLimit.js';
+
+const hasVision = isVisionConfigured();
 
 const ALLOWED_MIME = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
@@ -47,7 +50,8 @@ app.get('/api/health', (c) =>
   c.json({
     ok: true,
     // Lets the client warn the user before they try to use narration.
-    visionConfigured: hasGeminiKey,
+    visionConfigured: hasVision,
+    provider: env.provider,
     models: env.geminiModels,
     uptimeSec: Math.round(process.uptime()),
   }),
@@ -136,11 +140,11 @@ app.post(
     onError: (c) => c.json({ error: 'Image too large.' }, 413),
   }),
   async (c) => {
-    if (!hasGeminiKey) {
+    if (!hasVision) {
       return c.json(
         {
           error:
-            'Vision is not configured. Add GEMINI_API_KEY to your .env file and restart the server.',
+            'Vision is not configured. Set GOOGLE_CLOUD_PROJECT (Vertex AI) or GEMINI_API_KEY in .env and restart the server.',
           code: 'NO_API_KEY',
         },
         503,
@@ -259,7 +263,7 @@ app.post(
     onError: (c) => c.json({ error: 'Image too large.' }, 413),
   }),
   async (c) => {
-    if (!hasGeminiKey) {
+    if (!hasVision) {
       return c.json(
         { error: 'Vision is not configured.', code: 'NO_API_KEY' },
         503,
@@ -327,13 +331,17 @@ app.notFound((c) => c.json({ error: 'Not found.' }, 404));
 serve({ fetch: app.fetch, port: env.port, hostname: '0.0.0.0' }, (info) => {
   console.log(`\n  Blind View API  →  http://localhost:${info.port}`);
   console.log(`  Models          →  ${env.geminiModels.join(' → ')}`);
-  if (hasGeminiKey) {
-    console.log('  Gemini key      →  loaded\n');
+  if (env.provider === 'vertex' && hasVision) {
+    console.log(
+      `  Provider        →  Vertex AI (${env.gcpProject}, ${env.vertexLocation})\n`,
+    );
+  } else if (hasVision) {
+    console.log('  Provider        →  AI Studio key\n');
   } else {
     console.warn(
-      '\n  ⚠  GEMINI_API_KEY is missing.\n' +
+      '\n  ⚠  Vision is not configured.\n' +
         '     On-device hazard alerts will still work, but scene narration will not.\n' +
-        '     Get a free key at https://aistudio.google.com/apikey and put it in .env\n',
+        '     Set GOOGLE_CLOUD_PROJECT (Vertex AI) or GEMINI_API_KEY in .env\n',
     );
   }
 });
