@@ -60,6 +60,8 @@ export const env = {
     .map((model) => model.trim())
     .filter(Boolean),
   port: num(process.env.PORT, 8787),
+  /** Require Firebase App Check + ID tokens on paid endpoints. On in production. */
+  requireAppCheck: process.env.REQUIRE_APP_CHECK?.trim() === 'true',
   rateLimitPerMin: num(process.env.RATE_LIMIT_PER_MIN, 60),
   maxImageKb: num(process.env.MAX_IMAGE_KB, 2048),
   allowedOrigins: (

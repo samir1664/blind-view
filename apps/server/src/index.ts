@@ -5,7 +5,10 @@ import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 
 import { env } from './env.js';
+import { firebaseVerifiers } from './firebaseAuth.js';
 import { GeminiError, generateDescription } from './gemini.js';
+import { createGuard } from './guard.js';
+import type { GuardEnv } from './guard.js';
 import { classifyPlace } from './place.js';
 import type { PlaceContext } from './place.js';
 import { PLACE_CATEGORIES } from './playbooks.js';
@@ -26,7 +29,12 @@ const LAN_ORIGIN_RE =
 
 const isProduction = process.env.NODE_ENV === 'production';
 
-const app = new Hono();
+const app = new Hono<GuardEnv>();
+
+const guard = createGuard({
+  required: env.requireAppCheck,
+  ...firebaseVerifiers,
+});
 
 app.use('*', logger());
 
@@ -41,7 +49,7 @@ app.use(
       return null;
     },
     allowMethods: ['GET', 'POST', 'OPTIONS'],
-    allowHeaders: ['Content-Type'],
+    allowHeaders: ['Content-Type', 'Authorization', 'X-Firebase-AppCheck'],
     maxAge: 86_400,
   }),
 );
@@ -139,6 +147,7 @@ app.post(
     maxSize: (env.maxImageKb + 64) * 1024,
     onError: (c) => c.json({ error: 'Image too large.' }, 413),
   }),
+  guard,
   async (c) => {
     if (!hasVision) {
       return c.json(
@@ -151,12 +160,7 @@ app.post(
       );
     }
 
-    const clientKey =
-      c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
-      c.req.header('cf-connecting-ip') ||
-      'local';
-
-    const limit = checkRateLimit(clientKey, env.rateLimitPerMin);
+    const limit = checkRateLimit(c.get('clientKey'), env.rateLimitPerMin);
     if (!limit.allowed) {
       c.header('Retry-After', String(limit.retryAfterSec));
       return c.json(
@@ -262,6 +266,7 @@ app.post(
     maxSize: (env.maxImageKb + 64) * 1024,
     onError: (c) => c.json({ error: 'Image too large.' }, 413),
   }),
+  guard,
   async (c) => {
     if (!hasVision) {
       return c.json(
@@ -270,12 +275,7 @@ app.post(
       );
     }
 
-    const clientKey =
-      c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
-      c.req.header('cf-connecting-ip') ||
-      'local';
-
-    const limit = checkRateLimit(clientKey, env.rateLimitPerMin);
+    const limit = checkRateLimit(c.get('clientKey'), env.rateLimitPerMin);
     if (!limit.allowed) {
       c.header('Retry-After', String(limit.retryAfterSec));
       return c.json({ error: 'Too many requests.', code: 'RATE_LIMITED' }, 429);
@@ -331,6 +331,9 @@ app.notFound((c) => c.json({ error: 'Not found.' }, 404));
 serve({ fetch: app.fetch, port: env.port, hostname: '0.0.0.0' }, (info) => {
   console.log(`\n  Blind View API  →  http://localhost:${info.port}`);
   console.log(`  Models          →  ${env.geminiModels.join(' → ')}`);
+  console.log(
+    `  App Check       →  ${env.requireAppCheck ? 'required' : 'off (local dev)'}`,
+  );
   if (env.provider === 'vertex' && hasVision) {
     console.log(
       `  Provider        →  Vertex AI (${env.gcpProject}, ${env.vertexLocation})\n`,
