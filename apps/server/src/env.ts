@@ -59,6 +59,17 @@ export const env = {
     .split(',')
     .map((model) => model.trim())
     .filter(Boolean),
+  /**
+   * Model for structured scene analysis (/api/scene). Benchmarked 2026-10-09 on
+   * street/home/office photos: 3.5 Flash-Lite answers in ~2.7-3.6 s with correct
+   * place, traffic and sides; 3.5 Flash and 3.8 Flash took 7-15 s or timed out.
+   */
+  sceneModels: (process.env.SCENE_MODEL?.trim() || 'gemini-3.5-flash-lite,gemini-3.1-flash-lite')
+    .split(',')
+    .map((model) => model.trim())
+    .filter(Boolean),
+  /** Thinking level for scene analysis: minimal | low | medium. Latency lever. */
+  sceneThinking: process.env.SCENE_THINKING?.trim() || 'low',
   port: num(process.env.PORT, 8787),
   /** Require Firebase App Check + ID tokens on paid endpoints. On in production. */
   requireAppCheck: process.env.REQUIRE_APP_CHECK?.trim() === 'true',

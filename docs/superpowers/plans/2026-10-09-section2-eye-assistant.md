@@ -33,7 +33,10 @@ Files: create `apps/server/src/geometry.ts`, `geometry.test.ts`.
 Interfaces: `directionOf(box: [ymin,xmin,ymax,xmax], mirrored: boolean): Direction` (5 sectors: 'on your left' | 'slightly left' | 'straight ahead' | 'slightly right' | 'on your right'); `proximityOf(box): Proximity` ('right in front of you' | 'within reach' | 'a few steps ahead' | 'further ahead'); `fillPlaceholders(say: string, objects: SceneObject[], mirrored: boolean): string` replaces `{dir:id}` / `{near:id}`, drops unknown ids cleanly.
 - [ ] failing tests (sectors, mirroring, proximity bands, placeholder fill, unknown id, no leftover braces) → implement → pass → commit.
 
-### Task S2-2: `/api/scene` (server)
+### Task S2-2: `/api/scene` (server) — DONE
+- Benchmark (real photos: Bangalore traffic, Kolkata living room, office): **gemini-3.5-flash-lite + thinking low = 2.7–3.6 s**, correct place/traffic/sides. 3.5 Flash 7.6 s/timeouts; 3.8 Flash timeouts; 3.8 rejects thinking "minimal".
+- Finding: single-frame motion direction is unreliable (3.8 said rickshaw "away", Flash-Lite "towards" on the same photo) → prompt forbids "towards/away" claims unless on-device tracker events say so. Motion direction comes ONLY from the client tracker.
+- Read task: empty `text` → fixed honest sentence enforced in code (`speechFor`).
 Files: create `apps/server/src/scene.ts`, `scenePrompts.ts`, `scene.test.ts`; modify `index.ts`.
 Interfaces: `POST /api/scene` body `{ imageBase64, mimeType, task: 'orient'|'update'|'find'|'read'|'ask'|'verify_step', query?, previous?, localEvents?: string[], walking?: boolean, mirrored?: boolean, verbosity? }` → `{ say: string, facts: SceneFacts, latencyMs }`.
 - Gemini `gemini-3.8-flash` (fallback `gemini-3.5-flash`), `responseSchema` for objects/place/path/text/say, thinking low.

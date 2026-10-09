@@ -62,10 +62,11 @@ export const SAFETY_SETTINGS = [
 export async function callGemini(
   body: unknown,
   timeoutMs = 15_000,
+  models: string[] = env.geminiModels,
 ): Promise<string> {
   let lastError: GeminiError | null = null;
 
-  for (const model of env.geminiModels) {
+  for (const model of models) {
     try {
       return await callModel(model, body, timeoutMs);
     } catch (error) {

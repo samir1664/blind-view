@@ -17,6 +17,9 @@ import { buildPrompt, MODES, VERBOSITIES } from './prompts.js';
 import type { Mode, Verbosity } from './prompts.js';
 import { isVisionConfigured } from './provider.js';
 import { checkRateLimit } from './rateLimit.js';
+import { analyzeScene } from './scene.js';
+import { SCENE_TASKS } from './scenePrompts.js';
+import type { SceneTask } from './scenePrompts.js';
 
 const hasVision = isVisionConfigured();
 
@@ -326,7 +329,83 @@ app.post(
   },
 );
 
+/**
+ * The eye assistant's single vision call: structured scene analysis with
+ * directions computed from boxes, returned as ready-to-speak text.
+ */
+app.post(
+  '/api/scene',
+  bodyLimit({
+    maxSize: (env.maxImageKb + 64) * 1024,
+    onError: (c) => c.json({ error: 'Image too large.' }, 413),
+  }),
+  guard,
+  async (c) => {
+    if (!hasVision) {
+      return c.json({ error: 'Vision is not configured.', code: 'NO_API_KEY' }, 503);
+    }
+
+    const limit = checkRateLimit(c.get('clientKey'), env.rateLimitPerMin);
+    if (!limit.allowed) {
+      c.header('Retry-After', String(limit.retryAfterSec));
+      return c.json({ error: 'Too many requests.', code: 'RATE_LIMITED' }, 429);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = await c.req.json<Record<string, unknown>>();
+    } catch {
+      return c.json({ error: 'Malformed request body.' }, 400);
+    }
+
+    const image = parseImage(body.imageBase64, body.mimeType);
+    if ('error' in image) {
+      return c.json({ error: image.error }, image.status);
+    }
+
+    const task = SCENE_TASKS.includes(body.task as SceneTask)
+      ? (body.task as SceneTask)
+      : 'orient';
+    const verbosity = VERBOSITIES.includes(body.verbosity as Verbosity)
+      ? (body.verbosity as Verbosity)
+      : 'normal';
+    const text = (value: unknown, max: number) =>
+      typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, max) : undefined;
+
+    const startedAt = Date.now();
+    try {
+      const result = await analyzeScene({
+        imageBase64: image.data,
+        mimeType: image.mimeType,
+        task,
+        verbosity,
+        query: text(body.query, 200),
+        previous: text(body.previous, 400),
+        localEvents: Array.isArray(body.localEvents)
+          ? body.localEvents
+              .filter((e): e is string => typeof e === 'string')
+              .slice(0, 6)
+              .map((e) => e.slice(0, 80))
+          : [],
+        walking: typeof body.walking === 'boolean' ? body.walking : undefined,
+        mirrored: body.mirrored === true,
+      });
+      return c.json({ ...result, task, latencyMs: Date.now() - startedAt });
+    } catch (error) {
+      if (error instanceof GeminiError) {
+        if (error.status === 429 || error.status === 503) {
+          c.header('Retry-After', error.status === 429 ? '30' : '5');
+        }
+        return c.json({ error: error.message, retryable: error.retryable }, error.status as 400);
+      }
+      console.error('[scene] unexpected failure', error);
+      return c.json({ error: 'Scene analysis failed.', retryable: true }, 500);
+    }
+  },
+);
+
 app.notFound((c) => c.json({ error: 'Not found.' }, 404));
+
 
 serve({ fetch: app.fetch, port: env.port, hostname: '0.0.0.0' }, (info) => {
   console.log(`\n  Blind View API  →  http://localhost:${info.port}`);
