@@ -42,7 +42,10 @@ Interfaces: `POST /api/scene` body `{ imageBase64, mimeType, task: 'orient'|'upd
 - Gemini `gemini-3.8-flash` (fallback `gemini-3.5-flash`), `responseSchema` for objects/place/path/text/say, thinking low.
 - [ ] tests for parse/validate/clamp (`parseSceneResponse`) and prompt building per task → implement → smoke with a real image (office photo) → commit.
 
-### Task S2-3: Live relay (server)
+### Task S2-3: Live relay (server) — DONE
+- Verified end-to-end via local relay: connect+setup 2.4 s; `[SAY]` greeting spoken verbatim; "Where am I?" → `where_am_i` tool call in 0.2 s; tool result spoken verbatim ~2.3 s later. Voice "Aoede".
+- Security: origin check on upgrade, auth message within 5 s (App Check + ID token) when required, one session per uid, 30 min cap, client cannot set model/instructions/tools, tool_result reduced to {say, ok, found}.
+- Cloud Run deploy now uses `--timeout 3600`.
 Files: create `apps/server/src/live.ts`, `liveSetup.ts`, `liveSetup.test.ts`; modify `index.ts`, `package.json` (+ `@hono/node-ws`, `ws`).
 Protocol (client⇄server JSON): C→S `auth{appCheck,idToken}`, `audio{data}`, `say{text}`, `text{text}`, `tool_result{id,name,response}`; S→C `ready`, `audio{data}`, `interrupted`, `turn_complete`, `transcript{role,text}`, `tool_call{calls}`, `error{message}`.
 - Server builds setup: model, system instruction, tools (S2 tool list), `contextWindowCompression.slidingWindow`, `sessionResumption`, input+output transcription. On `goAway` reconnects upstream with the latest resumption handle.

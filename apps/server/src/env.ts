@@ -70,6 +70,11 @@ export const env = {
     .filter(Boolean),
   /** Thinking level for scene analysis: minimal | low | medium. Latency lever. */
   sceneThinking: process.env.SCENE_THINKING?.trim() || 'low',
+  /** Gemini Live (voice). Only us-central1 serves it for this project (probed 2026-10-09). */
+  liveLocation: process.env.LIVE_LOCATION?.trim() || 'us-central1',
+  liveModel: process.env.LIVE_MODEL?.trim() || 'gemini-live-2.5-flash-native-audio',
+  liveVoice: process.env.LIVE_VOICE?.trim() || 'Aoede',
+  liveMaxMinutes: num(process.env.LIVE_MAX_MINUTES, 30),
   port: num(process.env.PORT, 8787),
   /** Require Firebase App Check + ID tokens on paid endpoints. On in production. */
   requireAppCheck: process.env.REQUIRE_APP_CHECK?.trim() === 'true',

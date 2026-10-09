@@ -9,6 +9,7 @@ import { firebaseVerifiers } from './firebaseAuth.js';
 import { GeminiError, generateDescription } from './gemini.js';
 import { createGuard } from './guard.js';
 import type { GuardEnv } from './guard.js';
+import { mountLive } from './live.js';
 import { classifyPlace } from './place.js';
 import type { PlaceContext } from './place.js';
 import { PLACE_CATEGORIES } from './playbooks.js';
@@ -32,6 +33,13 @@ const LAN_ORIGIN_RE =
 
 const isProduction = process.env.NODE_ENV === 'production';
 
+function isAllowedOrigin(origin: string | undefined): boolean {
+  if (!origin) return !isProduction; // non-browser clients only in dev
+  if (env.allowedOrigins.includes('*')) return true;
+  if (env.allowedOrigins.includes(origin)) return true;
+  return !isProduction && LAN_ORIGIN_RE.test(origin);
+}
+
 const app = new Hono<GuardEnv>();
 
 const guard = createGuard({
@@ -46,10 +54,7 @@ app.use(
   cors({
     origin: (origin) => {
       if (!origin) return origin; // same-origin / native shell
-      if (env.allowedOrigins.includes('*')) return origin;
-      if (env.allowedOrigins.includes(origin)) return origin;
-      if (!isProduction && LAN_ORIGIN_RE.test(origin)) return origin;
-      return null;
+      return isAllowedOrigin(origin) ? origin : null;
     },
     allowMethods: ['GET', 'POST', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'Authorization', 'X-Firebase-AppCheck'],
@@ -404,10 +409,12 @@ app.post(
   },
 );
 
+const injectWebSocket = mountLive(app, isAllowedOrigin);
+
 app.notFound((c) => c.json({ error: 'Not found.' }, 404));
 
 
-serve({ fetch: app.fetch, port: env.port, hostname: '0.0.0.0' }, (info) => {
+const server = serve({ fetch: app.fetch, port: env.port, hostname: '0.0.0.0' }, (info) => {
   console.log(`\n  Blind View API  →  http://localhost:${info.port}`);
   console.log(`  Models          →  ${env.geminiModels.join(' → ')}`);
   console.log(
@@ -426,4 +433,7 @@ serve({ fetch: app.fetch, port: env.port, hostname: '0.0.0.0' }, (info) => {
         '     Set GOOGLE_CLOUD_PROJECT (Vertex AI) or GEMINI_API_KEY in .env\n',
     );
   }
+  console.log(`  Live voice      →  ${env.liveModel} (${env.liveLocation}) at /api/live\n`);
 });
+
+injectWebSocket(server);
