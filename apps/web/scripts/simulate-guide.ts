@@ -137,6 +137,50 @@ const stepUp = makeDepth((_x, y) => (y < 0.78 ? 0.2 + y * 1.6 + 0.9 : 0.2 + y * 
 /** Flat ground with a wall filling the left third. */
 const wallLeft = makeDepth((x, y) => (x < 0.3 ? 2.6 : 0.2 + y * 1.6));
 
+console.log('\n── Scenario 4: walking past parked car — must stay silent (no "coming towards")');
+{
+  const tr = new ObjectTracker({ sensitivity: 'medium', cooldownMs: 5000 });
+  tr.setWalking(true, 1.2);
+  const dir = new NarrationDirector({ minGapMs: 1600 });
+  let spoke = 0;
+  let now4 = 2_000_000;
+  for (let frame = 0; frame < 24; frame += 1) {
+    const t = (frame * FPS_MS) / 1000;
+    // Parked car ahead, user walks toward it at 1.2 m/s: 8m -> ~5m. Static object must NOT be "coming towards".
+    const dist = Math.max(2, 8 - 1.2 * t);
+    const det = [box('car', dist, 0.5)];
+    const spatial = det.map((d) => toSpatial(d, FRAME_W, FRAME_H));
+    const { events } = tr.update(spatial, FRAME_W, now4);
+    const spoken = dir.submit(events, null, null, now4);
+    spoke += spoken.length;
+    for (const u of spoken) console.log(`t=${t.toFixed(2)}s  UNEXPECTED: ${u.text}`);
+    // Approaching events must not claim parked car is coming towards user.
+    for (const e of events) if (e.kind === 'approaching') console.log(`t=${t.toFixed(2)}s  FAIL approaching: ${e.phrase}`);
+    now4 += FPS_MS;
+  }
+  console.log(spoke === 0 ? 'PASS: silent (parked car not "coming towards")' : `FAIL: spoke ${spoke} times`);
+}
+
+console.log('\n── Scenario 5: static desk aisle — must stay silent (no "blocked" / "step")');
+{
+  const tr = new ObjectTracker({ sensitivity: 'medium', cooldownMs: 5000 });
+  tr.setWalking(false);
+  const dir = new NarrationDirector({ minGapMs: 1600 });
+  let spoke = 0;
+  let now5 = 3_000_000;
+  for (let frame = 0; frame < 16; frame += 1) {
+    const spatial = [box2('chair', 2.5, 0.3)].map((d) => toSpatial(d, FRAME_W, FRAME_H));
+    const { events } = tr.update(spatial, FRAME_W, now5);
+    const guidance = analyzePath(spatial, FRAME_W, FRAME_H);
+    const terrain = analyzeTerrain(flat);
+    const spoken = dir.submit(events, guidance, terrain, now5);
+    spoke += spoken.length;
+    for (const u of spoken) console.log(`UNEXPECTED: ${u.text}`);
+    now5 += FPS_MS;
+  }
+  console.log(spoke === 0 ? 'PASS: silent (static desk, no false blocked/step)' : `FAIL: spoke ${spoke} times`);
+}
+
 for (const [name, map] of [
   ['flat ground        ', flat],
   ['kerb / drop ahead  ', dropOff],

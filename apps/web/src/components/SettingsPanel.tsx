@@ -3,6 +3,16 @@ import { useEffect, useState } from 'react';
 import { audioEngine } from '../lib/audio/AudioEngine';
 import type { AudioDiagnostics } from '../lib/audio/AudioEngine';
 import { playEarcon, unlockAudio } from '../lib/audio/earcons';
+import {
+  hasVoiceForLanguage,
+  resolveSpeechLanguage,
+  SUPPORTED_LANGUAGES,
+} from '../lib/audio/voice';
+
+/** The device language, for the "System default" label. */
+const systemLanguage =
+  typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en';
+
 import { useSettings } from '../store/settings';
 import type { Sensitivity } from '../lib/vision/tracking';
 import type { Verbosity } from '../types';
@@ -187,6 +197,36 @@ export function SettingsPanel() {
           format={(v) => `${Math.round(v * 100)} percent`}
           onChange={(speechVolume) => settings.update({ speechVolume })}
         />
+
+        <label className="field">
+          <span className="field__label">Language</span>
+          <select
+            value={settings.language}
+            onChange={(event) =>
+              settings.update({ language: event.target.value })
+            }
+          >
+            {SUPPORTED_LANGUAGES.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.value === 'system'
+                  ? `System default (detected: ${systemLanguage})`
+                  : option.label}
+              </option>
+            ))}
+          </select>
+          <span className="field__hint">
+            Follows this device unless you pick one. If this device has no
+            voice for the language, Blind View uses the cloud voice instead
+            of staying silent.
+          </span>
+        </label>
+
+        {!hasVoiceForLanguage(voices, settings.language) && voices.length > 0 ? (
+          <p className="field__hint" role="status">
+            No {resolveSpeechLanguage(settings.language)} voice on this
+            device — will use cloud voice.
+          </p>
+        ) : null}
 
         <label className="field">
           <span className="field__label">Voice</span>

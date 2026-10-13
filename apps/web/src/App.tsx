@@ -1,6 +1,7 @@
 import { useState } from 'react';
 
 import { Disclaimer } from './components/Disclaimer';
+import { PlaybackControls } from './components/PlaybackControls';
 import { SettingsPanel } from './components/SettingsPanel';
 import { Transcript } from './components/Transcript';
 import { useEngine } from './hooks/useEngine';
@@ -28,7 +29,12 @@ export default function App() {
   const visionConfigured = useSession((state) => state.visionConfigured);
   const place = useSession((state) => state.place);
 
-  const { videoRef, toggle, requestMode, askByVoice } = useEngine();
+  const { videoRef, toggle, requestMode, askByVoice, startAssistant, assistantRef } = useEngine();
+  const runTool = (name: string, args: Record<string, unknown> = {}) => {
+    const c = assistantRef.current;
+    if (c) void c.runToolAndSpeak(name, args);
+    else void startAssistant().then(() => void assistantRef.current?.runToolAndSpeak(name, args));
+  };
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   // Hooks must run unconditionally, so this guard comes after them.
@@ -78,8 +84,8 @@ export default function App() {
 
       {visionConfigured === false ? (
         <p className="banner banner--warning" role="alert">
-          Scene description is off: the server has no <code>GEMINI_API_KEY</code>.
-          Hazard alerts still work. Add the key to <code>.env</code> and restart.
+          Scene description is off: the server has no vision configured.
+          Hazard alerts still work. Set <code>GOOGLE_CLOUD_PROJECT</code> (Vertex AI) or <code>GEMINI_API_KEY</code> in <code>.env</code> and restart.
         </p>
       ) : null}
 
@@ -105,6 +111,19 @@ export default function App() {
                 : 'Tap anywhere in this area to begin'}
             </span>
           </button>
+
+          <div className="playback-container">
+            <PlaybackControls />
+          </div>
+
+          <nav className="actions" aria-label="Voice menu">
+            <button type="button" className="btn btn--action" onClick={() => runTool('where_am_i')}>Where am I</button>
+            <button type="button" className="btn btn--action" onClick={() => runTool('start_narration')}>Narrate</button>
+            <button type="button" className="btn btn--action" onClick={() => runTool('find_object', { name: 'goggles' })}>Find goggles</button>
+            <button type="button" className="btn btn--action" onClick={() => runTool('take_me_to', { place: 'bakery' })}>Take me to</button>
+            <button type="button" className="btn btn--action" onClick={() => runTool('help')}>Help</button>
+            <button type="button" className="btn btn--action" onClick={() => void startAssistant()}>Eye Assistant</button>
+          </nav>
 
           <nav className="actions" aria-label="Ask about the view">
             <button

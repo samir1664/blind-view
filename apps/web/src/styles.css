@@ -488,6 +488,10 @@ body {
   gap: 12px;
 }
 
+/* ── Voice menu (S2-9): same large touch targets as other actions. Status uses role=status in App.tsx. */
+.actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.actions .btn--action { min-height: 64px; flex: 1 1 140px; }
+
 /* ── Footer ──────────────────────────────────────────────── */
 .footer {
   font-size: 0.85rem;

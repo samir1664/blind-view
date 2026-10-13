@@ -75,7 +75,7 @@ export const env = {
   liveModel: process.env.LIVE_MODEL?.trim() || 'gemini-live-2.5-flash-native-audio',
   liveVoice: process.env.LIVE_VOICE?.trim() || 'Aoede',
   liveMaxMinutes: num(process.env.LIVE_MAX_MINUTES, 30),
-  port: num(process.env.PORT, 8787),
+  port: num(process.env.PORT, 8788),
   /** Require Firebase App Check + ID tokens on paid endpoints. On in production. */
   requireAppCheck: process.env.REQUIRE_APP_CHECK?.trim() === 'true',
   rateLimitPerMin: num(process.env.RATE_LIMIT_PER_MIN, 60),

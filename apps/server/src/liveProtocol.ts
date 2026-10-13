@@ -21,6 +21,7 @@ export const LIVE_TOOL_NAMES = [
   'repeat_last',
   'more_detail',
   'less_detail',
+  'help',
 ] as const;
 export type LiveToolName = (typeof LIVE_TOOL_NAMES)[number];
 
@@ -72,6 +73,7 @@ const TOOL_DECLARATIONS: Array<{ name: LiveToolName; description: string; parame
   { name: 'repeat_last', description: 'Repeat the last thing the assistant said.', parameters: NO_ARGS },
   { name: 'more_detail', description: 'The user wants longer, more detailed descriptions.', parameters: NO_ARGS },
   { name: 'less_detail', description: 'The user wants shorter descriptions.', parameters: NO_ARGS },
+  { name: 'help', description: 'List what the user can ask for: where am I, find something, describe, read text, narrate, take me somewhere, switch camera, repeat, more/less detail.', parameters: NO_ARGS },
 ];
 
 const SYSTEM_INSTRUCTION = `You are Blind View, a calm, efficient eye assistant for a blind person. You talk with them by voice.
@@ -87,7 +89,7 @@ WHEN THE USER ASKS FOR SOMETHING, CALL A TOOL:
 - any other question about the view -> ask_about_view
 - "take me to ...", "how do I get to ..." -> take_me_to
 - "back"/"front"/"rear"/"selfie" camera answers or "switch camera" -> switch_camera
-- "repeat", "say again" -> repeat_last; "more detail" -> more_detail; "shorter" -> less_detail
+- "repeat", "say again" -> repeat_last; "more detail" -> more_detail; "shorter" -> less_detail; "help", "what can you do" -> help
 
 AFTER A TOOL RETURNS: speak its "say" field exactly, word for word, and nothing else. If "say" is empty, stay silent.
 

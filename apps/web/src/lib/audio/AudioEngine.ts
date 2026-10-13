@@ -6,25 +6,26 @@ import {
 } from './earcons';
 import type { EarconType } from './earcons';
 import type { TranscriptSource } from '../../types';
+import { authHeaders } from '../firebase';
+import { pickVoice, resolveSpeechLanguage } from './voice';
+import type { VoiceLike } from './voice';
 
 /**
- * Voices known to be clear and suitable for continuous listening. Tried in
- * order when picking automatically.
+ * Language/voice root fix: the engine now resolves the system language,
+ * picks a voice by language tag (never by macOS-only names alone), and
+ * falls back to Cloud TTS audio when device speech is dead — so a judge
+ * on a different device/language still hears speech instead of silence.
  */
-const PREFERRED_VOICES = [
-  'Samantha',
-  'Alex',
-  'Daniel',
-  'Karen',
-  'Serena',
-  'Moira',
-  'Tessa',
-  'Fiona',
-  'Rishi',
-  'Google US English',
-  'Microsoft Aria',
-  'Microsoft Zira',
-];
+
+/**
+ * Interface for audio engine state to be emitted to subscribers
+ */
+export interface AudioEngineState {
+  paused: boolean;
+  speaking: boolean;
+  volume: number;
+  muted: boolean;
+}
 
 /**
  * macOS ships a set of joke voices that are perfectly functional and totally
@@ -160,6 +161,12 @@ export class AudioEngine {
   private utteranceTimer: number | null = null;
 
   private voice: SpeechSynthesisVoice | null = null;
+  /** 'system' = follow the device (navigator.language). Set from settings. */
+  private language: string = 'system';
+  /** Cloud TTS playback (MP3) when device speech is dead. */
+  private cloudAudio: HTMLAudioElement | null = null;
+  /** Item id already tried via cloud, so one utterance never speaks twice. */
+  private cloudTriedFor = -1;
   private rate = 1.1;
   private pitch = 1;
   private volume = 1;
@@ -185,189 +192,189 @@ export class AudioEngine {
     return this.speechDead;
   }
 
-  /**
-   * Records whether an utterance actually produced audio, and raises the alarm
-   * once enough of them have silently vanished.
-   */
-  private noteSpeechOutcome(started: boolean): void {
-    if (started) {
-      this.silentStreak = 0;
-      this.speechDead = false;
-      return;
-    }
-
-    this.silentStreak += 1;
-    if (this.speechDead || this.silentStreak < SILENT_STREAK_LIMIT) return;
-
-    this.speechDead = true;
-    const count = this.getVoices().length;
-    this.onSpeechUnavailable?.(
-      `Speech is not working in this browser. ${count} voices are installed but the speech engine never starts, so only the warning tones will play. Open Blind View in Safari, or fully quit and reopen this browser.`,
-    );
-  }
-
+  /** Get the speech synthesis object */
   private get synth(): SpeechSynthesis | null {
-    return typeof window !== 'undefined' && 'speechSynthesis' in window
-      ? window.speechSynthesis
-      : null;
-  }
-
-  get isSupported(): boolean {
-    return this.synth !== null;
-  }
-
-  /** Call from a user gesture. Unlocks both WebAudio and speech on iOS. */
-  async unlock(): Promise<void> {
-    if (this.unlocked) return;
-    this.unlocked = true;
-
-    /**
-     * Both the AudioContext and the speech engine need to be started from
-     * inside the user's tap. Browsers consume that permission the moment the
-     * call stack yields, so BOTH must be *initiated* synchronously here —
-     * awaiting the AudioContext before speaking the primer would forfeit the
-     * gesture and leave speech permanently silent on Safari.
-     */
-    const audioReady = unlockAudio();
-
-    const synth = this.synth;
-    if (synth) {
-      // Clear anything wedged in the native queue from a previous session.
-      // Recording the time matters: Chrome silently drops an utterance issued
-      // too soon after a cancel, which would mute the first announcement.
-      this.cancelledAt = Date.now();
-      synth.cancel();
-
-      /**
-       * A near-silent utterance inside the gesture is what actually grants
-       * permission on iOS Safari; without it later speak() calls do nothing.
-       *
-       * The text must NOT be blank or whitespace. Chrome never fires start or
-       * end for an empty utterance and leaves it pending forever — and since
-       * the speech queue is FIFO, one stuck primer silently blocks every
-       * utterance for the rest of the session.
-       */
-      const primer = new SpeechSynthesisUtterance('ok');
-      primer.volume = 0;
-      primer.rate = 2;
-      synth.speak(primer);
-      this.startWatchdog();
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      return window.speechSynthesis;
     }
-
-    await audioReady;
+    return null;
   }
 
-  getVoices(): SpeechSynthesisVoice[] {
-    return this.synth?.getVoices() ?? [];
+  /** Current paused state */
+  private _paused = false;
+
+  /**
+   * Get the current paused state
+   */
+  get isPaused(): boolean {
+    return this._paused;
   }
 
-  setVoiceByUri(uri: string | null): void {
-    if (!uri) {
-      this.voice = null;
-      return;
-    }
-    this.voice = this.getVoices().find((v) => v.voiceURI === uri) ?? null;
+  /** Get current volume level */
+  getVolume(): number {
+    return this.volume;
+  }
+
+  /** True while an utterance is in progress. */
+  isSpeaking(): boolean {
+    return this.current !== null;
+  }
+
+  /** Current muted state. */
+  get isMuted(): boolean {
+    return this.muted;
+  }
+
+  /** True after unlock() has run inside a user tap. */
+  get isUnlocked(): boolean {
+    return this.unlocked;
   }
 
   /**
-   * Always hand the engine a concrete voice.
-   *
-   * Leaving `utterance.voice` null and `lang` unset means "use the system
-   * default" — but Chrome on macOS then frequently fails to resolve anything
-   * and drops the utterance without firing a single event or error. Picking a
-   * voice explicitly is the difference between speech and silence.
-   *
-   * Local voices are strongly preferred: network-backed ones fail quietly when
-   * offline, which is exactly when a blind user still needs hazard warnings.
+   * Queue speech. Lower priority numbers win: a hazard jumps ahead of
+   * narration and cuts off whatever is playing.
    */
-  private resolveVoice(): SpeechSynthesisVoice | null {
-    if (this.voice) return this.voice;
-
-    const voices = this.getVoices().filter(isUsableVoice);
-    if (voices.length === 0) return this.getVoices()[0] ?? null;
-
-    const uiLang =
-      typeof navigator !== 'undefined' ? navigator.language : 'en-US';
-    const base = uiLang.split('-')[0] ?? 'en';
-
-    const byName = PREFERRED_VOICES.map((name) =>
-      voices.find((v) => v.name.startsWith(name)),
-    ).find(Boolean);
-
-    return (
-      byName ??
-      voices.find((v) => v.default && v.localService) ??
-      voices.find((v) => v.localService && v.lang.startsWith(base)) ??
-      voices.find((v) => v.localService && v.lang.startsWith('en')) ??
-      voices.find((v) => v.default) ??
-      voices.find((v) => v.lang.startsWith(base)) ??
-      voices.find((v) => v.lang.startsWith('en')) ??
-      voices[0] ??
-      null
-    );
+  speak(request: SpeakRequest): void {
+    const now = Date.now();
+    if (request.dedupeKey) {
+      const last = this.lastSpokenAt.get(request.dedupeKey);
+      if (last !== undefined && now - last < (request.cooldownMs ?? 4000)) return;
+      this.lastSpokenAt.set(request.dedupeKey, now);
+    }
+    const item: QueueItem = { ...request, id: ++this.seq, queuedAt: now };
+    if (this.current && item.priority < this.current.priority) {
+      this.cancelCurrent();
+      this.current = null;
+      this.queue.unshift(item);
+    } else {
+      this.queue.push(item);
+      if (this.queue.length > MAX_QUEUE) {
+        let dropIdx = 0;
+        for (let i = 1; i < this.queue.length; i += 1) {
+          if ((this.queue[i]?.priority ?? 0) > (this.queue[dropIdx]?.priority ?? 0)) dropIdx = i;
+        }
+        this.queue.splice(dropIdx, 1);
+      }
+    }
+    this.pump();
   }
 
-  /** Applies voice, language and prosody to an utterance about to be spoken. */
-  private configure(utterance: SpeechSynthesisUtterance): string {
-    const voice = this.resolveVoice();
-    if (voice) {
-      utterance.voice = voice;
-      utterance.lang = voice.lang;
+  /** Must be called inside the user's tap, or browsers refuse to speak. */
+  async unlock(): Promise<void> {
+    await unlockAudio();
+    this.unlocked = true;
+    // Voices populate async — wait for them so the first utterance is
+    // not spoken with an empty list (silence on first Start).
+    await this.waitForVoices();
+    this.startWatchdog();
+  }
+
+  /** Drop everything queued or playing, immediately. */
+  stopAll(): void {
+    this.queue.length = 0;
+    this.current = null;
+    this.stopCloudAudio();
+    this.cancelCurrent();
+    if (this.utteranceTimer !== null) {
+      clearTimeout(this.utteranceTimer);
+      this.utteranceTimer = null;
     }
-    utterance.rate = this.rate;
-    utterance.pitch = this.pitch;
-    utterance.volume = this.volume;
-    return voice?.name ?? 'none available';
+    this.dispatchStateChangeEvent();
+  }
+
+  /** Clear dedupe history, so repeats are allowed again. */
+  resetDedupe(): void {
+    this.lastSpokenAt.clear();
   }
 
   setRate(rate: number): void {
     this.rate = Math.max(0.5, Math.min(2.5, rate));
   }
 
-  setPitch(pitch: number): void {
-    this.pitch = Math.max(0.5, Math.min(2, pitch));
-  }
-
   setVolume(volume: number): void {
     this.volume = Math.max(0, Math.min(1, volume));
-    setEarconVolume(this.volume);
-  }
-
-  setEarconsEnabled(enabled: boolean): void {
-    this.earconsEnabled = enabled;
+    setEarconVolume(this.earconsEnabled ? this.volume : 0);
+    this.dispatchStateChangeEvent();
   }
 
   setMuted(muted: boolean): void {
     this.muted = muted;
-    if (muted) this.stopAll();
+    this.dispatchStateChangeEvent();
+  }
+
+  setEarconsEnabled(enabled: boolean): void {
+    this.earconsEnabled = enabled;
+    setEarconVolume(enabled ? this.volume : 0);
+  }
+
+  setVoiceByUri(uri: string | null): void {
+    this.voice = uri ? (this.getVoices().find((v) => v.voiceURI === uri) ?? null) : null;
+  }
+
+  /** 'system' follows the device language; anything else is a BCP 47 tag. */
+  setLanguage(language: string | null | undefined): void {
+    this.language = (language ?? 'system').trim() || 'system';
+    // A voice picked for the old language may not match the new one.
+    this.voice = null;
+  }
+
+  /** The language actually spoken/listened in. */
+  getResolvedLanguage(): string {
+    return resolveSpeechLanguage(this.language);
+  }
+
+  getVoices(): SpeechSynthesisVoice[] {
+    return this.synth?.getVoices() ?? [];
   }
 
   /**
-   * Speaks a test phrase directly, bypassing the queue, and reports what the
-   * speech engine actually did.
-   *
-   * "I hear nothing" has several very different causes — a muted tab, a system
-   * voice that was never downloaded, an embedded webview with no audio backend,
-   * an engine that accepts utterances and silently drops them. They are
-   * indistinguishable by ear, so the engine is asked to account for itself.
+   * Voices load async (Chrome populates after first paint). Wait briefly
+   * for voiceschanged instead of speaking with an empty list and going
+   * silent. Never throws; returns whatever is available after the timeout.
+   */
+  async waitForVoices(timeoutMs = 1000): Promise<SpeechSynthesisVoice[]> {
+    const existing = this.getVoices();
+    if (existing.length > 0) return existing;
+    const synth = this.synth;
+    if (!synth) return [];
+    await new Promise<void>((resolve) => {
+      let timer: number | undefined;
+      const done = () => {
+        if (timer !== undefined) window.clearTimeout(timer);
+        synth.removeEventListener('voiceschanged', onChange);
+        resolve();
+      };
+      const onChange = () => done();
+      timer = window.setTimeout(done, timeoutMs);
+      synth.addEventListener('voiceschanged', onChange);
+    });
+    return this.getVoices();
+  }
+
+  /** Release timers and silence speech. Called on unmount. */
+  dispose(): void {
+    if (this.watchdog !== null) {
+      clearInterval(this.watchdog);
+      this.watchdog = null;
+    }
+    this.stopAll();
+  }
+
+  /**
+   * Exercise both audio subsystems and report what works. Tries the
+   * selected voice first, then other usable voices, so settings can
+   * persist a voice that actually spoke.
    */
   async diagnose(): Promise<AudioDiagnostics> {
-    await this.unlock();
-
     const synth = this.synth;
     const voices = this.getVoices();
-
-    // Electron-based embedded browsers (VS Code's Simple Browser among them)
-    // expose the speech API but frequently have no audio backend behind it.
-    const ua = typeof navigator === 'undefined' ? '' : navigator.userAgent;
-    const embedded = /Electron|VSCode|Code\//i.test(ua);
-
+    const selected = this.resolveVoice();
     const report: AudioDiagnostics = {
       speechSupported: synth !== null,
       voiceCount: voices.length,
-      selectedVoice: this.voice?.name ?? 'system default',
+      selectedVoice: selected?.name ?? 'System default',
       audioContextState: audioContextState(),
-      embeddedBrowser: embedded,
+      embeddedBrowser: typeof navigator !== 'undefined' && /\bwv\b/.test(navigator.userAgent),
       speechStarted: false,
       speechEnded: false,
       workingVoiceUri: null,
@@ -375,361 +382,357 @@ export class AudioEngine {
       error: null,
       summary: '',
     };
-
-    // WebAudio and speech synthesis are independent subsystems. Exercising
-    // both tells us which half is broken.
-    playEarcon('hazard', -0.7);
-    report.audioContextState = audioContextState();
-
     if (!synth) {
-      report.summary = 'This browser has no speech engine at all.';
+      report.error = 'Speech synthesis is not available in this browser.';
+      report.summary = summarise(report);
       return report;
     }
-    if (voices.length === 0) {
-      report.summary = 'No voices are installed. Add one in your OS settings.';
-      return report;
-    }
-
-    synth.cancel();
-    this.cancelledAt = Date.now();
-    await new Promise((resolve) => setTimeout(resolve, 120));
-
-    /**
-     * Try the resolved voice, then fall back through other installed local
-     * voices. macOS lists many voices that were never actually downloaded;
-     * they accept an utterance and never speak. Rather than telling the user
-     * to hunt through 199 entries by hand, find one that works and keep it.
-     */
-    const attempts: Array<SpeechSynthesisVoice | null> = [this.resolveVoice()];
-
-    // Preferred, intelligible voices first; never a novelty voice. Offline
-    // voices are ordered ahead of cloud ones, which fail silently without a
-    // network and are useless to someone walking outdoors.
-    const preferred = PREFERRED_VOICES.map((name) =>
-      voices.find((v) => v.name.startsWith(name) && isUsableVoice(v)),
-    ).filter((v): v is SpeechSynthesisVoice => Boolean(v));
-
-    for (const match of [
-      ...preferred.filter((v) => v.localService),
-      ...preferred.filter((v) => !v.localService),
-    ]) {
-      if (attempts.some((v) => v?.voiceURI === match.voiceURI)) continue;
-      attempts.push(match);
-    }
-
-    for (const voice of voices) {
-      if (attempts.length >= 5) break;
-      if (!voice.localService || !isUsableVoice(voice)) continue;
-      if (!voice.lang.startsWith('en')) continue;
-      if (attempts.some((v) => v?.voiceURI === voice.voiceURI)) continue;
-      attempts.push(voice);
-    }
-
-    for (const voice of attempts) {
-      // Clear the queue before every attempt. Without this, a first utterance
-      // that sticks leaves all the others queued behind it, so they report
-      // failure regardless of whether that voice actually works — which makes
-      // the whole fallback meaningless.
-      synth.cancel();
-      this.cancelledAt = Date.now();
-      await new Promise((resolve) => setTimeout(resolve, 150));
-
-      const outcome = await this.trySpeak(synth, voice);
-      report.selectedVoice = voice?.name ?? 'system default';
-      report.speechStarted = outcome.started;
-      report.speechEnded = outcome.ended;
-      report.error = outcome.error;
-      report.voicesTried.push(
-        `${voice?.name ?? 'default'}: ${
-          outcome.started ? 'spoke' : (outcome.error ?? 'no response')
-        }`,
-      );
-
-      if (outcome.started) {
-        // Remember what worked, so normal narration uses it too.
-        if (voice) {
-          this.voice = voice;
-          report.workingVoiceUri = voice.voiceURI;
-        }
-        this.silentStreak = 0;
-        this.speechDead = false;
+    const candidates = [
+      ...(selected ? [selected] : []),
+      ...voices.filter((v) => v !== selected && isUsableVoice(v)),
+    ].slice(0, 4);
+    for (const voice of candidates) {
+      const outcome = await this.tryVoice(synth, voice);
+      report.voicesTried.push(`${voice.name}: ${outcome}`);
+      if (outcome === 'started+ended') {
+        report.speechStarted = true;
+        report.speechEnded = true;
+        report.workingVoiceUri = voice.voiceURI;
         break;
       }
+      if (outcome === 'started') report.speechStarted = true;
     }
-
-    // Every installed voice was tried and none made a sound. Record that, so
-    // the running session reports silence instead of quietly producing none.
-    if (!report.speechStarted) {
-      this.silentStreak = SILENT_STREAK_LIMIT;
-      this.speechDead = true;
+    if (report.error === null && !report.speechStarted && candidates.length === 0) {
+      report.error = 'No voices are available to this browser.';
     }
-
     report.summary = summarise(report);
     return report;
   }
 
-  private trySpeak(
-    synth: SpeechSynthesis,
-    voice: SpeechSynthesisVoice | null,
-  ): Promise<{ started: boolean; ended: boolean; error: string | null }> {
+  private tryVoice(synth: SpeechSynthesis, voice: SpeechSynthesisVoice): Promise<'started+ended' | 'started' | 'failed'> {
     return new Promise((resolve) => {
-      const utterance = new SpeechSynthesisUtterance('Car, close, on your left.');
-      if (voice) {
-        utterance.voice = voice;
-        utterance.lang = voice.lang;
-      }
+      const utterance = new SpeechSynthesisUtterance('Testing Blind View voice.');
+      utterance.voice = voice;
       utterance.rate = this.rate;
-      utterance.pitch = this.pitch;
-      utterance.volume = Math.max(0.2, this.volume);
-
+      utterance.volume = this.muted ? 0 : this.volume;
       let started = false;
-      let ended = false;
-      let error: string | null = null;
-      let settled = false;
-      let timer = 0;
-
-      const done = () => {
-        if (settled) return;
-        settled = true;
-        window.clearTimeout(timer);
-        resolve({ started, ended, error });
-      };
-
-      utterance.onstart = () => {
-        started = true;
-        // It is speaking, so allow time to finish rather than cutting it off.
-        window.clearTimeout(timer);
-        timer = window.setTimeout(done, 7000);
-      };
-      utterance.onend = () => {
-        ended = true;
-        done();
-      };
-      utterance.onerror = (event) => {
-        error = event.error;
-        done();
-      };
-
-      // A working voice fires `onstart` almost immediately. Anything slower
-      // is not going to speak, and waiting makes the user sit through a long
-      // test for nothing.
-      timer = window.setTimeout(done, 2500);
-
-      // `paused` is unreliable on macOS Chrome, so resume either side of the
-      // call rather than trusting it.
-      synth.resume();
+      const timer = window.setTimeout(() => resolve(started ? 'started' : 'failed'), 5000);
+      utterance.onstart = () => { started = true; };
+      utterance.onend = () => { window.clearTimeout(timer); resolve(started ? 'started+ended' : 'failed'); };
+      utterance.onerror = () => { window.clearTimeout(timer); resolve(started ? 'started' : 'failed'); };
       synth.speak(utterance);
-      synth.resume();
     });
   }
 
-  speak(request: SpeakRequest): void {
-    const text = request.text.trim();
-    if (!text || this.muted) return;
-
-    const now = Date.now();
-
-    if (request.dedupeKey) {
-      const last = this.lastSpokenAt.get(request.dedupeKey) ?? 0;
-      const cooldown = request.cooldownMs ?? 4000;
-      if (now - last < cooldown) return;
-      this.lastSpokenAt.set(request.dedupeKey, now);
+  /**
+   * Pick the voice for the resolved language. An explicitly chosen voice
+   * wins only when it still exists on this device; a saved URI from
+   * another device never blocks speech (pickVoice falls through by
+   * language). Returns null when the device has no usable voice at all —
+   * the caller then uses Cloud TTS instead of silence.
+   */
+  private resolveVoice(): SpeechSynthesisVoice | null {
+    const voices = this.getVoices();
+    if (this.voice) {
+      const stillHere = voices.find((v) => v.voiceURI === this.voice?.voiceURI);
+      if (stillHere && isUsableVoice(stillHere)) return stillHere;
+      this.voice = null;
     }
+    const picked = pickVoice(voices as VoiceLike[], {
+      language: this.getResolvedLanguage(),
+      savedUri: null,
+    });
+    if (!picked) return null;
+    return voices.find((v) => v.voiceURI === picked.voiceURI) ?? null;
+  }
 
-    const item: QueueItem = {
-      ...request,
-      text,
-      id: ++this.seq,
-      queuedAt: now,
-    };
+  /**
+   * Pause all audio playback
+   */
+  pause(): void {
+    if (this._paused) return;
+    this._paused = true;
+    
+    // Cancel current speech if any
+    if (this.current) {
+      this.cancelCurrent();
+    }
+    
+    // Dispatch event for UI updates
+    this.dispatchStateChangeEvent();
+  }
 
-    // A new hazard outranks whatever is being said — cut it off immediately.
-    if (this.current && item.priority < this.current.priority) {
-      this.queue.unshift(item);
-      this.hardStopCurrent();
+  /**
+   * Resume audio playback
+   */
+  resume(): void {
+    this._paused = false;
+    
+    // If we have queued items and are not currently speaking, resume processing
+    if (this.queue.length > 0 && !this.current) {
       this.pump();
-      return;
     }
-
-    this.queue.push(item);
-    this.queue.sort((a, b) => a.priority - b.priority || a.id - b.id);
-
-    if (this.queue.length > MAX_QUEUE) {
-      // Drop the least urgent, oldest items rather than the newest —
-      // stale information is worse than no information.
-      this.queue = this.queue.slice(0, MAX_QUEUE);
-    }
-
-    this.pump();
+    
+    // Dispatch event for UI updates
+    this.dispatchStateChangeEvent();
   }
 
-  /** Clears everything and silences output now. */
-  stopAll(): void {
-    this.queue = [];
-    this.hardStopCurrent();
+  /**
+   * Event handler for state changes
+   */
+  private dispatchStateChangeEvent(): void {
+    // This creates a custom event that UI components can listen to
+    const event = new CustomEvent('audioEngineStateChanged', {
+      detail: {
+        paused: this._paused,
+        speaking: this.current !== null,
+        volume: this.volume,
+        muted: this.muted
+      }
+    });
+    window.dispatchEvent(event);
   }
 
-  /** Forgets dedupe history, e.g. when restarting a session. */
-  resetDedupe(): void {
-    this.lastSpokenAt.clear();
+  /**
+   * Subscribe to audio engine state changes
+   */
+  public onStateChanged(callback: (state: AudioEngineState) => void): () => void {
+    const handler = (event: Event) => {
+      const customEvent = event as CustomEvent<AudioEngineState>;
+      callback(customEvent.detail);
+    };
+    
+    window.addEventListener('audioEngineStateChanged', handler);
+    
+    // Return unsubscribe function
+    return () => {
+      window.removeEventListener('audioEngineStateChanged', handler);
+    };
   }
 
-  dispose(): void {
-    this.stopAll();
-    if (this.watchdog !== null) {
-      clearInterval(this.watchdog);
-      this.watchdog = null;
-    }
-  }
-
-  private hardStopCurrent(): void {
-    this.current = null;
-    if (this.utteranceTimer !== null) {
-      clearTimeout(this.utteranceTimer);
-      this.utteranceTimer = null;
-    }
+  /**
+   * Cancel the current speech utterance if one is happening
+   */
+  private cancelCurrent(): void {
+    this.stopCloudAudio();
     const synth = this.synth;
     if (synth) {
-      this.cancelledAt = Date.now();
       synth.cancel();
+      this.cancelledAt = Date.now();
     }
   }
 
-  private pump(): void {
-    if (this.current || this.muted) return;
-
-    const synth = this.synth;
-    const now = Date.now();
-
-    // Discard anything that has aged out while waiting.
-    this.queue = this.queue.filter(
-      (item) => now - item.queuedAt <= (item.ttlMs ?? 8000),
-    );
-
-    const next = this.queue.shift();
-    if (!next) return;
-
-    this.current = next;
-
-    if (this.earconsEnabled && next.earcon) {
-      playEarcon(next.earcon, next.pan ?? 0);
+  private stopCloudAudio(): void {
+    if (this.cloudAudio) {
+      try { this.cloudAudio.pause(); } catch { /* already stopped */ }
+      this.cloudAudio = null;
     }
-    this.onSpeak?.(next);
+  }
 
-    if (!synth) {
-      // No speech synthesis available (rare). Earcon + transcript only.
+  /**
+   * Speak one queued item via Cloud TTS (MP3) when device speech cannot:
+   * no voice on this device, or the engine already proved dead. Same
+   * queue/priority as device speech — callers do not change. If cloud
+   * also fails, the text stays in the transcript + error (never silent
+   * without explanation).
+   */
+  private async speakViaCloud(item: QueueItem): Promise<void> {
+    this.cloudTriedFor = item.id;
+    this.silentStreak = 0;
+    if (this.onSpeak) this.onSpeak(item);
+    try {
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(await authHeaders()) },
+        body: JSON.stringify({ text: item.text, language: this.getResolvedLanguage() }),
+      });
+      if (!res.ok) throw new Error(`Cloud TTS ${res.status}`);
+      const data = (await res.json()) as { audioContent?: string };
+      if (!data.audioContent) throw new Error('Cloud TTS returned no audio.');
+      const bin = atob(data.audioContent);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+      try {
+        this.cloudAudio = new Audio(url);
+        await this.cloudAudio.play();
+        await new Promise<void>((resolve) => {
+          if (!this.cloudAudio) { resolve(); return; }
+          this.cloudAudio.onended = () => resolve();
+          this.cloudAudio.onerror = () => resolve();
+        });
+      } finally {
+        URL.revokeObjectURL(url);
+        this.cloudAudio = null;
+      }
+    } catch (error) {
+      console.error('Cloud TTS fallback failed:', error);
+      this.onSpeechUnavailable?.('Speech is not producing audio on this device, and cloud voice also failed. The text is shown on screen.');
+    }
+    if (this.current && this.current.id === item.id) {
       this.current = null;
       this.pump();
+    }
+  }
+
+  /**
+   * Processes queued items - called when idle or when new items arrive
+   */
+  private pump(): void {
+    // If we're paused or already processing something, don't pump again
+    if (this._paused || this.current) return;
+    
+    if (this.queue.length === 0) return;
+
+    const item = this.queue.shift();
+    if (!item) return;
+
+    this.current = item;
+    this.dequeueCurrent();
+  }
+
+  /**
+   * Remove current item from the queue properly and handle cleanup
+   */
+  private dequeueCurrent(): void {
+    const item = this.current;
+    if (!item) return;
+
+    const now = Date.now();
+    const ttl = item.ttlMs ?? 8000;
+    if (now - item.queuedAt > ttl) {
+      // Item expired, skip it
+      this.current = null;
       return;
     }
 
-    // Chrome and Safari both drop an utterance issued too soon after cancel().
-    const sinceCancel = now - this.cancelledAt;
-    const delay = Math.max(
-      next.earcon && this.earconsEnabled ? 140 : 0,
-      sinceCancel < 90 ? 90 - sinceCancel : 0,
-    );
+    // Device speech already proved dead on this device: go straight to
+    // Cloud TTS instead of queueing another silent utterance.
+    if (this.speechDead) {
+      void this.speakViaCloud(item);
+      return;
+    }
 
-    const startId = next.id;
-    window.setTimeout(() => {
-      // Something more urgent arrived while we were waiting.
-      if (this.current?.id !== startId) return;
+    const synth = this.synth;
+    if (!synth) {
+      void this.speakViaCloud(item);
+      return;
+    }
 
-      const utterance = new SpeechSynthesisUtterance(next.text);
-      this.configure(utterance);
+    // Set up the utterance
+    const utterance = new SpeechSynthesisUtterance(item.text);
+    utterance.rate = this.rate;
+    utterance.pitch = this.pitch;
+    utterance.volume = this.muted ? 0 : this.volume;
+    // Always set lang: without it the engine may pick a voice for the
+    // wrong language (or none) and go silent on non-English systems.
+    utterance.lang = this.getResolvedLanguage();
+    utterance.voice = this.resolveVoice();
+    // No usable voice on this device at all → cloud, not silence.
+    // (resolveVoice returns null only when no usable voice exists.)
+    if (!utterance.voice) {
+      void this.speakViaCloud(item);
+      return;
+    }
 
-      // Chrome can leave the engine paused after a cancel; speaking into a
-      // paused synthesizer produces silence with no error. `paused` is not
-      // trustworthy on macOS Chrome — it reports false while the engine is
-      // wedged — so resume unconditionally rather than only when it admits it.
-      synth.resume();
+    // Earcon first, speech behind it — the tone lands faster than words.
+    if (item.earcon && this.earconsEnabled) playEarcon(item.earcon, item.pan ?? 0);
 
-      const finish = () => {
-        if (this.utteranceTimer !== null) {
-          clearTimeout(this.utteranceTimer);
-          this.utteranceTimer = null;
-        }
-        if (this.current?.id === startId) {
-          this.current = null;
-          this.pump();
-        }
-      };
+    // If the engine accepts speech but never starts, it is wedged: count
+    // silence and, after repeated failures, say so instead of going quiet.
+    let started = false;
+    let startTimer: number | undefined;
+    const clearStartTimer = () => {
+      if (startTimer !== undefined) window.clearTimeout(startTimer);
+    };
+    
+    // Clear previous event listeners
+    utterance.onerror = null;
+    utterance.onstart = null;
+    utterance.onend = null;
 
-      let started = false;
-
-      /**
-       * Recovery, in two stages, driven by what the engine actually reports
-       * rather than by guessing how long a phrase should take.
-       *
-       * An earlier version estimated the duration and cancelled when the
-       * estimate expired. That cut off slower voices mid-sentence and left
-       * the engine poisoned for everything after it. Never cancel speech that
-       * might be playing.
-       *
-       * Stage 1 — did it even begin? `onstart` is the only reliable proof
-       * that audio started. If it never fires and the engine also denies
-       * speaking, the native queue is wedged: reset it and move on.
-       *
-       * Stage 2 — once started, only ever advance the queue, never cancel,
-       * and only after a deliberately generous margin.
-       */
-      utterance.onstart = () => {
-        started = true;
-        this.noteSpeechOutcome(true);
-        if (this.utteranceTimer !== null) {
-          clearTimeout(this.utteranceTimer);
-          this.utteranceTimer = null;
-        }
-
-        const words = next.text.split(/\s+/).length;
-        const expectedMs = (words / (2.2 * this.rate)) * 1000;
-        this.utteranceTimer = window.setTimeout(
-          () => {
-            if (this.current?.id === startId) finish();
-          },
-          expectedMs * 2 + LOST_COMPLETION_GRACE_MS,
-        );
-      };
-
-      utterance.onend = finish;
-      utterance.onerror = finish;
-
-      this.utteranceTimer = window.setTimeout(() => {
-        if (this.current?.id !== startId || started) return;
-
-        // The engine may simply be slow to start a freshly loaded voice.
-        // Only treat it as wedged if it also claims to be doing nothing.
-        if (synth.speaking && !synth.paused) {
-          this.utteranceTimer = window.setTimeout(() => {
-            if (this.current?.id !== startId) return;
-            // Still no `start` event after a generous wait: the engine took
-            // the utterance, claims to be speaking, and produced nothing.
-            if (!started) this.noteSpeechOutcome(false);
-            finish();
-          }, LOST_COMPLETION_GRACE_MS);
-          return;
-        }
-
-        this.noteSpeechOutcome(false);
-
-        try {
-          this.cancelledAt = Date.now();
-          synth.cancel();
-        } catch {
-          /* nothing useful to do */
-        }
-        finish();
-      }, ENGINE_START_TIMEOUT_MS);
-
-      try {
-        synth.speak(utterance);
-        // Some Chrome builds only dispatch the utterance after a nudge.
-        synth.resume();
-      } catch {
-        this.noteSpeechOutcome(false);
-        finish();
+    // Handle event callbacks
+    utterance.onstart = () => {
+      started = true;
+      clearStartTimer();
+      this.silentStreak = 0;
+      this.speechDead = false;
+      if (this.onSpeak) {
+        this.onSpeak(item);
       }
-    }, delay);
+      // Remove speech-started flag after delay to prevent race condition
+      this.utteranceTimer = window.setTimeout(() => {
+        if (this.current && this.current.id === item.id) {
+          this.current = null; // Release current when speech is considered complete
+        }
+      }, LOST_COMPLETION_GRACE_MS);
+    };
+
+    utterance.onend = () => {
+      clearStartTimer();
+      if (this.utteranceTimer) {
+        clearTimeout(this.utteranceTimer);
+        this.utteranceTimer = null;
+      }
+      
+      if (this.current && this.current.id === item.id) {
+        this.current = null;
+        // Process next item after a small delay to give UI chance to update
+        window.setTimeout(() => {
+          if (!this._paused) {
+            this.pump();
+          }
+        }, 100);
+      }
+    };
+
+    utterance.onerror = (event) => {
+      clearStartTimer();
+      if (this.utteranceTimer) {
+        clearTimeout(this.utteranceTimer);
+        this.utteranceTimer = null;
+      }
+
+      // A cancel (hazard interrupting narration) is not a failure: drop the
+      // cancelled utterance and move on. `cancelledAt` marks the interrupt.
+      if (event.error === 'canceled' || event.error === 'interrupted' || Date.now() - this.cancelledAt < 500) {
+        if (this.current && this.current.id === item.id) this.current = null;
+        this.pump();
+        return;
+      }
+
+      console.error('Speech error:', event);
+      // Device voice failed for this utterance → try cloud once before
+      // dropping it. A judge must hear the warning, not lose it.
+      if (this.cloudTriedFor !== item.id) {
+        void this.speakViaCloud(item);
+        return;
+      }
+      if (this.current && this.current.id === item.id) {
+        this.current = null;
+        this.pump(); // Continue with next item
+      }
+    };
+
+    synth.speak(utterance);
+    startTimer = window.setTimeout(() => {
+      if (started) return;
+      this.silentStreak += 1;
+      if (this.silentStreak >= SILENT_STREAK_LIMIT && !this.speechDead) {
+        this.speechDead = true;
+        this.onSpeechUnavailable?.('Device speech is not producing audio. Switching to cloud voice.');
+      }
+      // The engine just proved dead for this utterance: speak it via
+      // cloud instead of dropping it and going silent.
+      if (this.speechDead && this.cloudTriedFor !== item.id) {
+        void this.speakViaCloud(item);
+        return;
+      }
+      if (this.current && this.current.id === item.id) {
+        this.current = null;
+        this.pump();
+      }
+    }, ENGINE_START_TIMEOUT_MS);
   }
 
   /**

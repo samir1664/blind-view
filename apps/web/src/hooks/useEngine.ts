@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from 'react';
-import type { ObjectDetection } from '@tensorflow-models/coco-ssd';
+import type { DetectorModel } from '../lib/vision/detector';
 
 import { audioEngine, Priority } from '../lib/audio/AudioEngine';
 import type { PriorityLevel } from '../lib/audio/AudioEngine';
@@ -17,6 +17,8 @@ import { toSpatial } from '../lib/vision/spatial';
 import { analyzeTerrain } from '../lib/vision/terrain';
 import type { TerrainReport } from '../lib/vision/terrain';
 import { ObjectTracker } from '../lib/vision/tracking';
+import { AssistantController } from '../lib/assistant/controller';
+import type { Sensitivity } from '../lib/vision/tracking';
 import { useSession } from '../store/session';
 import { useSettings } from '../store/settings';
 import type { NarrationMode, PlaceContext, TranscriptSource } from '../types';
@@ -86,7 +88,7 @@ export function useEngine() {
   const running = useRef(false);
   const stream = useRef<MediaStream | null>(null);
   const detector = useRef<DetectorModule | null>(null);
-  const model = useRef<ObjectDetection | null>(null);
+  const model = useRef<DetectorModel | null>(null);
   const tracker = useRef<ObjectTracker | null>(null);
   const director = useRef<NarrationDirector | null>(null);
   const scorer = useRef<FrameScorer | null>(null);
@@ -113,6 +115,10 @@ export function useEngine() {
   const lastFrameChange = useRef(0);
   const lastLabels = useRef<string[]>([]);
   const voiceCancel = useRef<(() => void) | null>(null);
+  // S2-6: assistant controller (Live/Classic voice + /api/scene). Old describe/place loop stays as fallback.
+  const assistant = useRef<AssistantController | null>(null);
+  const localEvents = useRef<string[]>([]);
+  const walking = useRef(false);
 
   // ── Speaking helper ─────────────────────────────────────────
   useEffect(() => {
@@ -138,21 +144,36 @@ export function useEngine() {
   }, []);
 
   // Keep the engine in sync with settings the user changes mid-run.
-  useEffect(
-    () =>
-      useSettings.subscribe((settings) => {
-        audioEngine.setRate(settings.speechRate);
-        audioEngine.setVolume(settings.speechVolume);
-        audioEngine.setEarconsEnabled(settings.earconsEnabled);
-        audioEngine.setVoiceByUri(settings.voiceURI);
-        tracker.current?.setOptions({
-          sensitivity: settings.sensitivity,
-          cooldownMs: settings.hazardCooldownMs,
-        });
-        director.current?.setOptions({ minGapMs: settings.calloutGapMs });
-      }),
-    [],
-  );
+  // Applied once on mount too: subscribe alone would leave the engine on
+  // defaults (English voice) until the user touches a setting — so a
+  // judge whose system is Hindi would hear nothing / wrong language.
+  useEffect(() => {
+    const apply = (settings: {
+      speechRate: number;
+      speechVolume: number;
+      earconsEnabled: boolean;
+      language: string;
+      voiceURI: string | null;
+      sensitivity: Sensitivity;
+      hazardCooldownMs: number;
+      calloutGapMs: number;
+    }) => {
+      audioEngine.setRate(settings.speechRate);
+      audioEngine.setVolume(settings.speechVolume);
+      audioEngine.setEarconsEnabled(settings.earconsEnabled);
+      // Language first: setVoiceByUri falls back by language when the
+      // saved voice does not exist on this device.
+      audioEngine.setLanguage(settings.language);
+      audioEngine.setVoiceByUri(settings.voiceURI);
+      tracker.current?.setOptions({
+        sensitivity: settings.sensitivity,
+        cooldownMs: settings.hazardCooldownMs,
+      });
+      director.current?.setOptions({ minGapMs: settings.calloutGapMs });
+    };
+    apply(useSettings.getState());
+    return useSettings.subscribe(apply);
+  }, []);
 
   // Probe the server once so we can tell the user up front if narration is off.
   useEffect(() => {
@@ -541,6 +562,7 @@ export function useEngine() {
     audioEngine.setRate(settings.speechRate);
     audioEngine.setVolume(settings.speechVolume);
     audioEngine.setEarconsEnabled(settings.earconsEnabled);
+    audioEngine.setLanguage(settings.language);
     audioEngine.setVoiceByUri(settings.voiceURI);
     audioEngine.resetDedupe();
 
@@ -717,5 +739,37 @@ export function useEngine() {
     [],
   );
 
-  return { videoRef, start, stop, toggle, requestMode, askByVoice };
+  // S2-6 + S2-10: start assistant (greeting -> camera -> orientation -> ready). Live first, ClassicVoice fallback on Live failure.
+  const startAssistant = useCallback(async () => {
+    const makeController = (voice: ConstructorParameters<typeof AssistantController>[0]['voice']) => new AssistantController({
+      voice,
+      getFrame: () => (videoRef.current ? captureFrame(videoRef.current) : null),
+      getWalking: () => walking.current,
+      isMirrored: () => useSettings.getState().cameraFacing === 'user',
+      getLocalEvents: () => [...localEvents.current],
+      onCameraChange: (which) => {
+        useSettings.getState().update({ cameraFacing: which === 'front' ? 'user' : 'environment' });
+      },
+      onStatus: () => {},
+      onTranscript: (role, text) => useSession.getState().addLine(role === 'user' ? 'system' : 'guide', text),
+    });
+    try {
+      const { LiveVoice } = await import('../lib/live/LiveVoice');
+      const voice = new LiveVoice() as unknown as ConstructorParameters<typeof AssistantController>[0]['voice'];
+      const controller = makeController(voice);
+      assistant.current = controller;
+      await controller.start();
+    } catch {
+      try {
+        const { ClassicVoice } = await import('../lib/assistant/ClassicVoice');
+        const voice = new ClassicVoice() as unknown as ConstructorParameters<typeof AssistantController>[0]['voice'];
+        const controller = makeController(voice);
+        assistant.current = controller;
+        await controller.start();
+      } catch { assistant.current = null; }
+    }
+  }, []);
+  const stopAssistant = useCallback(() => { assistant.current?.close(); assistant.current = null; }, []);
+
+  return { videoRef, start, stop, toggle, requestMode, askByVoice, startAssistant, stopAssistant, assistantRef: assistant };
 }

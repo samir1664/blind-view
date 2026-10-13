@@ -115,5 +115,23 @@ async function fetchDepthModel() {
   }
 }
 
+async function fetchEfficientDet() {
+  const file = join(MODEL_DIR, 'efficientdet-lite0.tflite');
+  const url = 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite';
+  if (await exists(file)) { const info = await stat(file); if (info.size > 1_000_000) { console.log(`[assets] EfficientDet present (${(info.size/1048576).toFixed(1)} MB).`); return; } }
+  await mkdir(MODEL_DIR, { recursive: true });
+  console.log('[assets] Downloading EfficientDet-Lite0 (~4 MB)…');
+  try { const r = await fetch(url); if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`); await pipeline(Readable.fromWeb(r.body), createWriteStream(file)); console.log('[assets] EfficientDet saved.'); } catch (e) { console.warn(`[assets] Could not download EfficientDet (${e.message}). Detector will fail until it is present.`); }
+}
+async function copyTasksVisionWasm() {
+  const src = join(repoRoot, 'node_modules/@mediapipe/tasks-vision/wasm');
+  const dst = join(webRoot, 'public/tasks-vision/wasm');
+  if (!(await exists(src))) { console.warn('[assets] tasks-vision wasm not installed; detector will use CDN fallback.'); return; }
+  await mkdir(dst, { recursive: true });
+  for (const name of await readdir(src)) { const from = join(src, name); const to = join(dst, name); if ((await exists(to)) && (await stat(to)).size === (await stat(from)).size) continue; await copyFile(from, to); }
+  console.log('[assets] tasks-vision WASM copied.');
+}
 await copyOrtRuntime();
 await fetchDepthModel();
+await fetchEfficientDet();
+await copyTasksVisionWasm();

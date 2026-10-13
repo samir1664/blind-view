@@ -24,7 +24,7 @@
       },
       {
         "source": "/@(models|ort)/**",
-        "headers": [{ "key": "Cache-Control", "value": "public, max-age=2592000" }]
+        "headers": [{ "key": "Cache-Control", "value": "public, max-age=2592000, immutable" }]
       },
       {
         "source": "/@(index.html|sw.js|registerSW.js|manifest.webmanifest)",

@@ -70,10 +70,10 @@ export function analyzePath(
     const baseRatio = frameHeight > 0 ? (y + h) / frameHeight : 1;
     if (baseRatio < 0.45) continue;
 
-    const distance =
-      detection.distanceM ??
-      // Unknown real-world size: fall back to how much of the view it fills.
-      (w * h) / (frameWidth * Math.max(1, frameHeight)) * 40;
+    // No fake distance: unknown-size objects have no distanceM. Skip them for
+    // clearance (depth still covers unnamed obstacles). Never invent metres.
+    const distance = detection.distanceM;
+    if (distance === null || distance === undefined) continue;
 
     if (distance > RELEVANT_RANGE_M) continue;
 
@@ -100,19 +100,12 @@ export function analyzePath(
     clearance[zone] > clearance[best] ? zone : best,
   );
 
-  let phrase: string | null = null;
-  let urgency = 0;
-
-  if (aheadBlocked) {
-    const gain = clearance[clearest] - clearance.ahead;
-    if (clearest !== 'ahead' && gain >= WORTHWHILE_GAIN_M && clearance[clearest] >= 3) {
-      phrase = `Keep a bit ${clearest}.`;
-      urgency = 0.6;
-    } else {
-      phrase = 'Blocked ahead.';
-      urgency = 0.75;
-    }
-  }
+  // F2/F5: path status is context for narrator, NOT spoken directly.
+  // "Blocked" may only be spoken by safety layer if walking + within reach
+  // directly ahead, confirmed ≥3 frames. So phrase/urgency stay 0 here.
+  const phrase: string | null = null;
+  const urgency = 0;
+  void WORTHWHILE_GAIN_M;
 
   return { clearance, aheadBlocked, clearest, phrase, urgency };
 }

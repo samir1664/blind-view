@@ -40,8 +40,7 @@ export default defineConfig({
         ],
       },
       workbox: {
-        // The TF.js model shards are large; cache them so the hazard layer
-        // keeps working offline after the first successful load.
+        // MediaPipe EfficientDet model is cached so the hazard layer keeps working offline after first load.
         maximumFileSizeToCacheInBytes: 8 * 1024 * 1024,
         // The ONNX runtime (14 MB) and depth model (26 MB) are deliberately
         // NOT precached: forcing a 40 MB download before first use would make
@@ -50,11 +49,11 @@ export default defineConfig({
         globIgnores: ['**/ort/**', '**/models/**'],
         runtimeCaching: [
           {
-            urlPattern: /^https:\/\/(storage\.googleapis\.com|tfhub\.dev)\/.*/i,
+            urlPattern: /^https:\/\/cdn\.jsdelivr\.net\/npm\/\@mediapipe\/tasks-vision\/.*/i,
             handler: 'CacheFirst',
             options: {
-              cacheName: 'tfjs-models',
-              expiration: { maxEntries: 40, maxAgeSeconds: 60 * 60 * 24 * 60 },
+              cacheName: 'mediapipe-wasm',
+              expiration: { maxEntries: 20, maxAgeSeconds: 60 * 60 * 24 * 60 },
               cacheableResponse: { statuses: [0, 200] },
             },
           },
@@ -95,8 +94,13 @@ export default defineConfig({
     host: true,
     proxy: {
       '/api': {
-        target: `http://localhost:${process.env.PORT || 8787}`,
+        // Server defaults to 8788 (apps/server/src/env.ts). Must match, or
+        // /api/health gets ECONNREFUSED and the UI shows vision as off
+        // even though curl to :8788 returns visionConfigured:true.
+        target: `http://localhost:${process.env.PORT || 8788}`,
         changeOrigin: true,
+        // /api/live is a WebSocket (the Gemini Live voice relay).
+        ws: true,
       },
     },
   },
@@ -105,13 +109,7 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
-          tfjs: [
-            '@tensorflow/tfjs-core',
-            '@tensorflow/tfjs-converter',
-            '@tensorflow/tfjs-backend-webgl',
-            '@tensorflow/tfjs-backend-cpu',
-            '@tensorflow-models/coco-ssd',
-          ],
+          mediapipe: ['@mediapipe/tasks-vision'],
         },
       },
     },

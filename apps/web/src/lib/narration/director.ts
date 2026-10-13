@@ -35,12 +35,6 @@ export interface DirectorOptions {
 /** Above this urgency an event interrupts whatever is being spoken. */
 const INTERRUPT_URGENCY = 0.85;
 
-/** Never merge more than this many observations into one sentence. */
-const MAX_MERGED = 2;
-
-/** Don't repeat the same steer more often than this. */
-const GUIDANCE_COOLDOWN_MS = 5000;
-
 /** Don't repeat an identical phrase within this window. */
 const PHRASE_COOLDOWN_MS = 5000;
 
@@ -48,11 +42,9 @@ const PHRASE_COOLDOWN_MS = 5000;
 const HISTORY_SIZE = 6;
 
 export class NarrationDirector {
-  private lastSpokeAt = 0;
-  private lastGuidanceAt = 0;
-  private lastGuidancePhrase: string | null = null;
   private spokenPhrases = new Map<string, number>();
   private history: string[] = [];
+  private contextLines: string[] = [];
 
   constructor(private options: DirectorOptions) {}
 
@@ -61,11 +53,9 @@ export class NarrationDirector {
   }
 
   reset(): void {
-    this.lastSpokeAt = 0;
-    this.lastGuidanceAt = 0;
-    this.lastGuidancePhrase = null;
     this.spokenPhrases.clear();
     this.history = [];
+    this.contextLines = [];
   }
 
   /** Lines already spoken, newest first — sent to the model so it won't repeat them. */
@@ -92,19 +82,14 @@ export class NarrationDirector {
     // ── Urgent: bypass all pacing and interrupt ──────────────
     // A break in the ground is weighed alongside closing hazards, because a
     // step down at your feet is every bit as time-critical as a car.
+    // F5: only imminent danger is spoken locally, as full sentence + earcon.
+    // Terrain/path status never speaks directly — it is context for narrator.
     const urgentEvent = events.find(
-      (event) => event.urgency >= INTERRUPT_URGENCY,
+      (event) => event.kind === 'imminent' && event.urgency >= INTERRUPT_URGENCY,
     );
-    const urgentTerrain =
-      terrain?.phrase && terrain.urgency >= INTERRUPT_URGENCY ? terrain : null;
-
-    const urgent =
-      urgentTerrain &&
-      (!urgentEvent || urgentTerrain.urgency > urgentEvent.urgency)
-        ? { phrase: urgentTerrain.phrase as string, pan: 0 }
-        : urgentEvent
-          ? { phrase: urgentEvent.phrase, pan: urgentEvent.pan }
-          : null;
+    const urgent = urgentEvent
+      ? { phrase: urgentEvent.phrase, pan: urgentEvent.pan }
+      : null;
 
     if (urgent && !this.isRepeat(urgent.phrase, now)) {
       this.mark(urgent.phrase, now);
@@ -120,59 +105,26 @@ export class NarrationDirector {
       return output;
     }
 
-    // ── Ordinary: paced, merged into a single sentence ───────
-    if (now - this.lastSpokeAt < this.options.minGapMs) return output;
-
-    const parts: string[] = [];
-    let pan = 0;
-    let topUrgency = 0;
-
+    // ── Ordinary: NOT spoken locally (F5). Local events become context for narrator. ──
+    // Collect context lines for /api/scene localEvents; narrator phrases them in full sentences.
     for (const event of events) {
-      if (parts.length >= MAX_MERGED) break;
-      if (this.isRepeat(event.phrase, now)) continue;
-      this.mark(event.phrase, now);
-      parts.push(event.phrase);
-      if (event.urgency > topUrgency) {
-        topUrgency = event.urgency;
-        pan = event.pan;
-      }
+      if (this.contextLines.length >= 6) this.contextLines.shift();
+      this.contextLines.push(event.phrase);
     }
-
-    // A steer is appended to whatever we were already saying, so the user
-    // hears "Dog coming towards you, keep a bit left" as one instruction.
-    // Terrain wins over object steering: the ground matters more than a bin.
-    const steer = terrain?.phrase ?? guidance?.phrase ?? null;
-    const steerUrgency = terrain?.phrase
-      ? terrain.urgency
-      : (guidance?.urgency ?? 0);
-
-    if (
-      steer &&
-      (steer !== this.lastGuidancePhrase ||
-        now - this.lastGuidanceAt >= GUIDANCE_COOLDOWN_MS)
-    ) {
-      this.lastGuidanceAt = now;
-      this.lastGuidancePhrase = steer;
-      parts.push(steer);
-      topUrgency = Math.max(topUrgency, steerUrgency);
+    if (guidance && guidance.aheadBlocked) {
+      this.contextLines.push(`path ${guidance.clearest} side is more open`);
     }
-
-    if (parts.length === 0) return output;
-
-    const text = joinPhrases(parts);
-    this.lastSpokeAt = now;
-    this.noteSpoken(text);
-
-    output.push({
-      text,
-      priority: topUrgency >= 0.5 ? Priority.HAZARD : Priority.ALERT,
-      source: 'guide',
-      earcon: topUrgency >= 0.5 ? 'hazard' : 'alert',
-      pan,
-      ttlMs: 3000,
-    });
-
+    if (terrain && terrain.aheadBlocked) {
+      this.contextLines.push('ground ahead looks blocked');
+    }
     return output;
+  }
+
+  /** Local events as context for narrator (drained by caller for /api/scene). */
+  takeContext(): string[] {
+    const out = [...this.contextLines];
+    this.contextLines = [];
+    return out;
   }
 
   private isRepeat(phrase: string, now: number): boolean {
@@ -188,23 +140,4 @@ export class NarrationDirector {
       }
     }
   }
-}
-
-/**
- * "Man passing on your right." + "Keep a bit left."
- *   → "Man passing on your right, keep a bit left."
- */
-function joinPhrases(parts: string[]): string {
-  const cleaned = parts
-    .map((part) => part.trim().replace(/[.]+$/, ''))
-    .filter(Boolean);
-  if (cleaned.length === 0) return '';
-
-  const [head, ...rest] = cleaned;
-  const tail = rest.map((part) =>
-    // Keep acronyms and "I" intact; only de-capitalise ordinary words.
-    /^[A-Z][a-z]/.test(part) ? part.charAt(0).toLowerCase() + part.slice(1) : part,
-  );
-
-  return `${[head, ...tail].join(', ')}.`;
 }

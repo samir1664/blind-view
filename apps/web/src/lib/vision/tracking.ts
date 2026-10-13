@@ -97,8 +97,16 @@ export interface TrackerResult {
 export class ObjectTracker {
   private tracks: Track[] = [];
   private nextId = 1;
+  private walking = false;
+  private walkingSpeed = 1.2;
 
   constructor(private options: TrackerOptions) {}
+
+  /** Ego-motion state from MotionTracker. While walking, static objects close at walking speed. */
+  setWalking(walking: boolean, speedMps = 1.2): void {
+    this.walking = walking;
+    this.walkingSpeed = speedMps;
+  }
 
   setOptions(options: Partial<TrackerOptions>): void {
     this.options = { ...this.options, ...options };
@@ -286,7 +294,10 @@ export class ObjectTracker {
         });
       }
 
-      if (isMobile && approach !== null && approach >= 0.45 && (distance ?? 99) <= 9) {
+      // Ego-motion gate (F3): while walking, static people/cars close at walking speed.
+      // Only call it "coming towards" if closing clearly faster than walking, or moving sideways.
+      const approachThreshold = this.walking ? this.walkingSpeed + 0.6 : 0.45;
+      if (isMobile && approach !== null && approach >= approachThreshold && (distance ?? 99) <= 9) {
         candidates.push({
           kind: 'approaching',
           urgency: 0.45 + 0.4 * severity,

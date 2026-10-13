@@ -47,6 +47,13 @@ export interface SettingsState {
   speechRate: number;
   speechVolume: number;
   voiceURI: string | null;
+  /**
+   * Speech language: 'system' (default) follows the device language
+   * (navigator.language). A saved value from another device never blocks
+   * speech: voice picking falls back by language when the exact voice is
+   * missing. See lib/audio/voice.ts.
+   */
+  language: string;
 
   cameraFacing: 'environment' | 'user';
   /** Sighted helpers and developers want the preview; blind users do not. */
@@ -79,6 +86,7 @@ const DEFAULTS = {
   speechRate: 1.15,
   speechVolume: 1,
   voiceURI: null,
+  language: 'system',
   cameraFacing: 'environment' as const,
   showPreview: true,
 };

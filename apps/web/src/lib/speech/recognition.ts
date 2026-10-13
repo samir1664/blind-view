@@ -8,6 +8,12 @@
  */
 
 import type { NarrationMode } from '../../types';
+import { resolveSpeechLanguage } from '../audio/voice';
+
+/** Language the device listens in: saved setting, else system language. */
+export function resolveListenLanguage(explicit?: string | null): string {
+  return resolveSpeechLanguage(explicit);
+}
 
 interface SpeechRecognitionAlternativeLike {
   transcript: string;
@@ -78,9 +84,13 @@ const FRIENDLY_ERRORS: Record<string, string> = {
   'audio-capture': 'No microphone found.',
 };
 
-/** Listens for a single phrase and resolves with the transcript. */
+/**
+ * Listens for a single phrase and resolves with the transcript.
+ * `lang` defaults to the system language ('system' = navigator.language),
+ * not hardcoded en-US — a judge whose system is Hindi must be heard too.
+ */
 export function listenOnce(
-  lang = 'en-US',
+  lang: string | null | undefined = 'system',
   timeoutMs = 8000,
 ): { promise: Promise<string>; cancel: () => void } {
   const Ctor = getConstructor();
@@ -98,7 +108,7 @@ export function listenOnce(
   }
 
   const recognition = new Ctor();
-  recognition.lang = lang;
+  recognition.lang = resolveListenLanguage(lang);
   recognition.continuous = false;
   recognition.interimResults = false;
   recognition.maxAlternatives = 1;

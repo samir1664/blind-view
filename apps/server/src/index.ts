@@ -19,6 +19,7 @@ import type { Mode, Verbosity } from './prompts.js';
 import { isVisionConfigured } from './provider.js';
 import { checkRateLimit } from './rateLimit.js';
 import { analyzeScene } from './scene.js';
+import { synthesizeSpeech } from './tts.js';
 import { SCENE_TASKS } from './scenePrompts.js';
 import type { SceneTask } from './scenePrompts.js';
 
@@ -408,6 +409,29 @@ app.post(
     }
   },
 );
+
+/** Fallback voice: Cloud TTS (Chirp 3 HD) when Live fails. Same guard + rate limit as /api/scene. */
+app.post('/api/tts', guard, async (c) => {
+  const limit = checkRateLimit(c.get('clientKey'), env.rateLimitPerMin);
+  if (!limit.allowed) {
+    c.header('Retry-After', String(limit.retryAfterSec));
+    return c.json({ error: 'Too many requests.', code: 'RATE_LIMITED' }, 429);
+  }
+  let body: { text?: unknown; language?: unknown };
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Malformed request body.' }, 400); }
+  const text = typeof body.text === 'string' ? body.text : '';
+  if (!text.trim()) return c.json({ error: 'Missing text.' }, 400);
+  const language = typeof body.language === 'string' && body.language.trim()
+    ? body.language.trim().slice(0, 20)
+    : 'en-US';
+  try {
+    const audio = await synthesizeSpeech(text, language);
+    return c.json({ audioContent: audio, mimeType: 'audio/mpeg' });
+  } catch (error) {
+    console.error('[tts] failed', error);
+    return c.json({ error: 'Speech synthesis failed.', retryable: true }, 500);
+  }
+});
 
 const injectWebSocket = mountLive(app, isAllowedOrigin);
 

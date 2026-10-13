@@ -65,6 +65,24 @@ export interface TerrainReport {
   urgency: number;
 }
 
+/** Step candidate must persist ≥3 frames at consistent position before verify_step. Unconfirmed = silent. */
+export class StepCandidateTracker {
+  private count = 0;
+  private lastKind: 'up' | 'down' | null = null;
+  private lastRow = 0;
+  update(step: TerrainStep | null): TerrainStep | null {
+    if (!step) { this.count = 0; this.lastKind = null; return null; }
+    if (this.lastKind === step.kind && Math.abs(this.lastRow - step.rowFraction) < 0.08) {
+      this.count += 1;
+    } else {
+      this.count = 1; this.lastKind = step.kind; this.lastRow = step.rowFraction;
+    }
+    this.lastRow = step.rowFraction;
+    return this.count >= 3 ? step : null;
+  }
+  reset(): void { this.count = 0; this.lastKind = null; }
+}
+
 export function analyzeTerrain(map: DepthMap): TerrainReport | null {
   const { data, size } = map;
   if (!size || data.length < size * size) return null;
@@ -93,28 +111,11 @@ export function analyzeTerrain(map: DepthMap): TerrainReport | null {
   const aheadBlocked = openness.ahead < 1 - BLOCKED_THRESHOLD;
   const step = findStep(data, size, norm);
 
-  let phrase: string | null = null;
-  let urgency = 0;
-
-  // A break in the ground outranks an obstacle: you can bump into a bollard,
-  // but you fall down a step.
-  if (step) {
-    const immediate = step.rowFraction > 0.72;
-    if (step.kind === 'down') {
-      phrase = immediate ? 'Step down, right in front of you.' : 'Step down ahead.';
-      urgency = immediate ? 0.95 : 0.7;
-    } else {
-      phrase = immediate ? 'Step up, right in front of you.' : 'Step up ahead.';
-      urgency = immediate ? 0.8 : 0.6;
-    }
-  } else if (aheadBlocked) {
-    const gain = openness[clearest] - openness.ahead;
-    phrase =
-      clearest !== 'ahead' && gain > 0.18
-        ? `Something ahead, keep ${clearest}.`
-        : 'Something blocking the way ahead.';
-    urgency = 0.65;
-  }
+  // F1/F2/F5: local layer never speaks path/step status directly. Step is a
+  // candidate only — caller must confirm via StepCandidateTracker (≥3 frames)
+  // + /api/scene verify_step before speaking. Path status is context for narrator.
+  const phrase: string | null = null;
+  const urgency = 0;
 
   return { openness, clearest, aheadBlocked, step, phrase, urgency };
 }

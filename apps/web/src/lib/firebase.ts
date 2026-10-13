@@ -76,14 +76,26 @@ async function init(): Promise<HeaderSource> {
  * into a spoken message — while on-device hazard alerts keep working.
  */
 export async function authHeaders(): Promise<Record<string, string>> {
-  if (!firebaseEnabled) return {};
+  const tokens = await firebaseTokens();
+  return tokens
+    ? { 'X-Firebase-AppCheck': tokens.appCheck, Authorization: `Bearer ${tokens.idToken}` }
+    : {};
+}
+
+/** Raw tokens, for the Live WebSocket which cannot carry custom headers. */
+export async function firebaseTokens(): Promise<{ appCheck: string; idToken: string } | null> {
+  if (!firebaseEnabled) return null;
   ready ??= init();
   try {
-    return await (await ready)();
+    const headers = await (await ready)();
+    return {
+      appCheck: headers['X-Firebase-AppCheck'] ?? '',
+      idToken: (headers.Authorization ?? '').replace(/^Bearer /, ''),
+    };
   } catch (error) {
     console.warn('[firebase] could not obtain security tokens', error);
     // Allow a later call to retry initialisation from scratch.
     ready = null;
-    return {};
+    return null;
   }
 }

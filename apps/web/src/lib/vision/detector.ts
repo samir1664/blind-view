@@ -1,96 +1,67 @@
-import * as tf from '@tensorflow/tfjs-core';
-import '@tensorflow/tfjs-converter';
-import '@tensorflow/tfjs-backend-webgl';
-import '@tensorflow/tfjs-backend-cpu';
-import * as cocoSsd from '@tensorflow-models/coco-ssd';
-
+import { FilesetResolver, ObjectDetector } from '@mediapipe/tasks-vision';
 import type { Detection } from '../../types';
 
 /**
- * Tier-1 detector: runs entirely on the device, costs nothing, works offline.
- *
- * We use COCO-SSD with the `lite_mobilenet_v2` base rather than a YOLO ONNX
- * export for one practical reason: the weights are hosted and versioned by
- * Google, so there is no model file to vendor, host, or keep from 404-ing.
- * It knows the 80 COCO classes, which happens to include almost everything
- * that can hurt a pedestrian — car, bus, truck, motorcycle, bicycle, person,
- * dog, traffic light, stop sign, bench, fire hydrant.
- *
- * Backend choice is WebGL, not WebGPU: WebGL is the only GPU path that works
- * on iOS Safari today, and it is fast enough here. Revisit WebGPU once Safari
- * ships it broadly.
+ * Tier-1 detector: MediaPipe EfficientDet-Lite0 (COCO 80 classes).
+ * Replaces TFJS COCO-SSD: faster on mobile GPU, smaller, no TFJS bundle.
+ * Same interface: loadDetector() / detectFrame(model, source) / disposeDetector() / getBackend().
+ * Model file: public/models/efficientdet-lite0.tflite (downloaded by scripts/setup-assets.mjs).
+ * WASM: /tasks-vision/wasm (copied by setup-assets) or CDN fallback.
  */
 
-let modelPromise: Promise<cocoSsd.ObjectDetection> | null = null;
+export type DetectorModel = ObjectDetector;
+
+let modelPromise: Promise<ObjectDetector> | null = null;
 let activeBackend = 'unknown';
 
-export function getBackend(): string {
-  return activeBackend;
-}
+export function getBackend(): string { return activeBackend; }
 
-export async function loadDetector(): Promise<cocoSsd.ObjectDetection> {
+export async function loadDetector(): Promise<ObjectDetector> {
   if (modelPromise) return modelPromise;
-
   modelPromise = (async () => {
+    let vision;
     try {
-      await tf.setBackend('webgl');
-      await tf.ready();
+      vision = await FilesetResolver.forVisionTasks('/tasks-vision/wasm');
+      activeBackend = 'mediapipe-gpu';
     } catch {
-      await tf.setBackend('cpu');
-      await tf.ready();
+      vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.20/wasm');
+      activeBackend = 'mediapipe-gpu-cdn';
     }
-    activeBackend = tf.getBackend();
-
-    const model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
-
-    // First inference compiles shaders and is 10–20× slower than the rest.
-    // Burn it on a blank canvas so the user's first real frame is fast.
-    const warmup = document.createElement('canvas');
-    warmup.width = 320;
-    warmup.height = 240;
-    const ctx = warmup.getContext('2d');
-    if (ctx) {
-      ctx.fillStyle = '#000';
-      ctx.fillRect(0, 0, warmup.width, warmup.height);
-      await model.detect(warmup);
-    }
-
-    return model;
+    const detector = await ObjectDetector.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: '/models/efficientdet-lite0.tflite', delegate: 'GPU' },
+      scoreThreshold: 0.5,
+      maxResults: 12,
+    });
+    // Warmup on blank canvas so first real frame is fast.
+    try {
+      const warmup = document.createElement('canvas');
+      warmup.width = 320; warmup.height = 240;
+      const ctx = warmup.getContext('2d');
+      if (ctx) { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, 320, 240); detector.detect(warmup); }
+    } catch { /* warmup best-effort */ }
+    return detector;
   })();
-
-  try {
-    return await modelPromise;
-  } catch (error) {
-    // Allow a retry on the next call instead of caching the failure forever.
-    modelPromise = null;
-    throw error;
-  }
+  try { return await modelPromise; } catch (e) { modelPromise = null; throw e; }
 }
 
-export interface DetectOptions {
-  maxBoxes?: number;
-  minScore?: number;
-}
+export interface DetectOptions { maxBoxes?: number; minScore?: number; }
 
 export async function detectFrame(
-  model: cocoSsd.ObjectDetection,
+  model: ObjectDetector,
   source: HTMLVideoElement | HTMLCanvasElement,
   { maxBoxes = 12, minScore = 0.5 }: DetectOptions = {},
 ): Promise<Detection[]> {
-  const predictions = await model.detect(source, maxBoxes, minScore);
-
-  return predictions.map((prediction) => ({
-    label: prediction.class,
-    score: prediction.score,
-    bbox: [
-      prediction.bbox[0],
-      prediction.bbox[1],
-      prediction.bbox[2],
-      prediction.bbox[3],
-    ] as [number, number, number, number],
-  }));
+  const out = model.detect(source as HTMLVideoElement);
+  const dets = (out?.detections ?? []).slice(0, maxBoxes);
+  const result: Detection[] = [];
+  for (const d of dets) {
+    const cat = d.categories?.[0];
+    if (!cat || cat.score < minScore) continue;
+    const b = d.boundingBox;
+    if (!b) continue;
+    result.push({ label: cat.categoryName || 'object', score: cat.score, bbox: [b.originX, b.originY, b.width, b.height] });
+  }
+  return result;
 }
 
-export function disposeDetector(): void {
-  modelPromise = null;
-}
+export function disposeDetector(): void { modelPromise = null; }
