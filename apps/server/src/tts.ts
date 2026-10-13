@@ -1,4 +1,5 @@
 /** Cloud Text-to-Speech fallback (Chirp 3 HD). Used when Live fails. */
+import { env } from './env.js';
 import { authHeaders } from './provider.js';
 
 const TTS_URL = 'https://texttospeech.googleapis.com/v1/text:synthesize';
@@ -20,7 +21,14 @@ export async function synthesizeSpeech(text: string, languageCode = 'en-US'): Pr
   else if (lang.toLowerCase().startsWith('en')) voice.name = 'en-US-Chirp3-HD-Aoede';
   const res = await fetch(TTS_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(await authHeaders()) },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(await authHeaders()),
+      // Local ADC (user login) has no quota project by default, so Google
+      // rejects TTS with 403 "requires a quota project". Sending it
+      // explicitly fixes local dev AND Cloud Run (harmless there).
+      ...(env.gcpProject ? { 'x-goog-user-project': env.gcpProject } : {}),
+    },
     body: JSON.stringify({
       input: { text: clean },
       voice,

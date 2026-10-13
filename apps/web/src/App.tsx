@@ -1,6 +1,7 @@
 import { useState } from 'react';
 
 import { Disclaimer } from './components/Disclaimer';
+import { FeedbackButtons } from './components/FeedbackButtons'; 
 import { PlaybackControls } from './components/PlaybackControls';
 import { SettingsPanel } from './components/SettingsPanel';
 import { Transcript } from './components/Transcript';
@@ -160,6 +161,7 @@ export default function App() {
           <section className="panel panel--transcript" aria-label="What was spoken">
             <h2 className="panel__heading">Spoken history</h2>
             <Transcript />
+            <FeedbackButtons />
           </section>
         </>
       )}

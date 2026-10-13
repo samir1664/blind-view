@@ -18,6 +18,7 @@ import { buildPrompt, MODES, VERBOSITIES } from './prompts.js';
 import type { Mode, Verbosity } from './prompts.js';
 import { isVisionConfigured } from './provider.js';
 import { checkRateLimit } from './rateLimit.js';
+import { storeFeedback, validateFeedbackBody } from './feedback.js';
 import { analyzeScene } from './scene.js';
 import { synthesizeSpeech } from './tts.js';
 import { SCENE_TASKS } from './scenePrompts.js';
@@ -431,6 +432,25 @@ app.post('/api/tts', guard, async (c) => {
     console.error('[tts] failed', error);
     return c.json({ error: 'Speech synthesis failed.', retryable: true }, 500);
   }
+});
+
+/**
+ * Anonymous helpful Yes/No feedback → Cloud Firestore. Same guard + rate
+ * limit as /api/scene. Always answers 200 { stored } when the body is valid
+ * — a Firestore outage must never surface as an error to the user.
+ */
+app.post('/api/feedback', guard, async (c) => {
+  const limit = checkRateLimit(c.get('clientKey'), env.rateLimitPerMin);
+  if (!limit.allowed) {
+    c.header('Retry-After', String(limit.retryAfterSec));
+    return c.json({ error: 'Too many requests.', code: 'RATE_LIMITED' }, 429);
+  }
+  let body: unknown;
+  try { body = await c.req.json(); } catch { return c.json({ error: 'Malformed request body.' }, 400); }
+  const validated = validateFeedbackBody(body);
+  if (!validated.ok) return c.json({ error: validated.error }, 400);
+  const stored = await storeFeedback(validated.value);
+  return c.json({ stored });
 });
 
 const injectWebSocket = mountLive(app, isAllowedOrigin);
