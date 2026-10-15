@@ -1,12 +1,13 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
-import { Disclaimer } from './components/Disclaimer';
-import { FeedbackButtons } from './components/FeedbackButtons'; 
+import { FeedbackButtons } from './components/FeedbackButtons';
+import { InstallPrompt, isInstalled } from './components/InstallPrompt'; 
 import { PlaybackControls } from './components/PlaybackControls';
 import { SettingsPanel } from './components/SettingsPanel';
 import { Transcript } from './components/Transcript';
 import { useEngine } from './hooks/useEngine';
-import { isVoiceInputSupported } from './lib/speech/recognition';
+import { audioEngine, Priority } from './lib/audio/AudioEngine';
+import { isVoiceInputSupported } from './lib/speech/recognition'; 
 import { useSession } from './store/session';
 import { useSettings } from './store/settings';
 import type { EngineStatus } from './types';
@@ -20,7 +21,6 @@ const STATUS_TEXT: Record<EngineStatus, string> = {
 };
 
 export default function App() {
-  const disclaimerAcceptedAt = useSettings((state) => state.disclaimerAcceptedAt);
   const showPreview = useSettings((state) => state.showPreview);
 
   const status = useSession((state) => state.status);
@@ -38,14 +38,67 @@ export default function App() {
   };
   const [settingsOpen, setSettingsOpen] = useState(false);
 
-  // Hooks must run unconditionally, so this guard comes after them.
-  if (!disclaimerAcceptedAt) return <Disclaimer />;
+  // Voice-first startup: no instruction screen to read. Browsers block
+  // speech until a user gesture, so the FIRST tap / keypress unlocks audio
+  // and speaks the greeting (+ the short safety line on first launch only).
+  // That same tap also starts the app via the tap-anywhere handler below.
+  const greetedRef = useRef(false);
+  useEffect(() => {
+    const greet = async () => {
+      if (greetedRef.current) return;
+      greetedRef.current = true;
+      await audioEngine.unlock();
+      try {
+        if (!localStorage.getItem('blindview:disclaimerSpoken:v1')) {
+          localStorage.setItem('blindview:disclaimerSpoken:v1', '1');
+          audioEngine.speak({
+            text: 'Blind View helps you, it does not replace a white cane or a guide dog.',
+            priority: Priority.INFO,
+            source: 'system',
+          });
+        }
+      } catch { /* private mode: skip the spoken safety line */ }
+      audioEngine.speak({
+        text: 'Hello, this is Blind View. Tap anywhere to start. Tap again to stop.',
+        priority: Priority.INFO,
+        source: 'system',
+      });
+      if (!isInstalled()) {
+        audioEngine.speak({
+          text: "Once it's on your Home Screen, you can say Hey Siri or Hey Google, open Blind View.",
+          priority: Priority.INFO,
+          source: 'system',
+        });
+      }
+    };
+    const onFirstGesture = () => { void greet(); };
+    window.addEventListener('pointerdown', onFirstGesture, { once: true });
+    window.addEventListener('keydown', onFirstGesture, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', onFirstGesture);
+      window.removeEventListener('keydown', onFirstGesture);
+    };
+  }, []);
 
   const isRunning = status === 'running';
   const isStarting = status === 'requesting-camera' || status === 'loading-model';
 
+  // The whole screen is one giant Start/Stop toggle. Taps on real controls
+  // (buttons, inputs, the install card, the transcript) keep their own
+  // behaviour and never toggle.
+  const onTapAnywhere = (e: React.MouseEvent) => {
+    if (isStarting) return;
+    const el = e.target as HTMLElement;
+    if (el.closest('button, a, input, select, textarea, [data-no-toggle]')) return;
+    toggle();
+  };
+
   return (
-    <div className="app">
+    <div
+      className="app"
+      onClick={onTapAnywhere}
+      aria-label={isRunning ? 'Tap anywhere to stop Blind View' : 'Tap anywhere to start Blind View'}
+    >
       {/* Kept mounted even when hidden: removing it from the DOM tears down
           the camera stream, and `display: none` pauses playback on Safari. */}
       <video
@@ -91,11 +144,12 @@ export default function App() {
       ) : null}
 
       {settingsOpen ? (
-        <section className="panel" aria-label="Settings">
+        <section className="panel" aria-label="Settings" data-no-toggle>
           <SettingsPanel />
         </section>
       ) : (
         <>
+          <InstallPrompt />
           <button
             type="button"
             className={`main-button ${isRunning ? 'main-button--on' : ''}`}
@@ -107,9 +161,7 @@ export default function App() {
               {isStarting ? 'Starting…' : isRunning ? 'Stop' : 'Start'}
             </span>
             <span className="main-button__sub">
-              {isRunning
-                ? 'Blind View is listening to the camera'
-                : 'Tap anywhere in this area to begin'}
+              {isRunning ? 'Tap anywhere to stop' : 'Tap anywhere to start'}
             </span>
           </button>
 
@@ -158,7 +210,7 @@ export default function App() {
             </button>
           </nav>
 
-          <section className="panel panel--transcript" aria-label="What was spoken">
+          <section className="panel panel--transcript" aria-label="What was spoken" data-no-toggle>
             <h2 className="panel__heading">Spoken history</h2>
             <Transcript />
             <FeedbackButtons />

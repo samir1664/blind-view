@@ -7,8 +7,9 @@
 import { authHeaders } from '../firebase';
 import type { CapturedFrame } from '../vision/capture';
 import { FIND_TICK_MS, isDuplicate, NARRATION_TICK_MS, pickUpdate } from './narration';
-import { findExpired, scanGuidance, startFind } from './find';
+import { decideFindTick, findExpired, matchesTarget, startFind } from './find';
 import type { FindState } from './find';
+import { StillnessGate } from '../vision/motion';
 import { cameraAnnounce, GREETING, HELP_TEXT, READY_TEXT, TAKE_ME_TO_SOON } from './tools';
 
 export interface VoiceLike {
@@ -30,6 +31,10 @@ export interface ControllerOpts {
   voice: VoiceLike;
   getFrame: () => CapturedFrame | null;
   getWalking: () => boolean;
+  /** On-device detector labels this frame (for Find cross-check). */
+  getDetections?: () => string[];
+  /** Camera-frame motion (for the stillness gate). */
+  getFrameMoving?: () => boolean;
   isMirrored: () => boolean;
   getLocalEvents: () => string[];
   onCameraChange: (which: 'back' | 'front') => void;
@@ -53,6 +58,8 @@ export class AssistantController {
   private camera: 'back' | 'front' = 'back';
   private cameraChoice: 'back' | 'front' | null = null;
   private started = false;
+  /** Motion-aware narration: moving = narrate, still 6s = ask once, then wait. */
+  private stillGate = new StillnessGate();
 
   constructor(opts: ControllerOpts) {
     this.opts = opts;
@@ -62,6 +69,7 @@ export class AssistantController {
   }
 
   get isNarrating(): boolean { return this.narrating; }
+  get isFinding(): boolean { return this.findState !== null; }
   get currentCamera(): 'back' | 'front' { return this.camera; }
 
   private speak(text: string): void {
@@ -187,6 +195,15 @@ export class AssistantController {
   private async narrationTick(): Promise<void> {
     if (!this.narrating) return;
     if (this.voice.isSpeaking() || this.voice.userIsTalking?.(2500)) return;
+    // Never ask "How can I help?" while a Find / question is in progress.
+    if (this.findState) { this.stillGate.reset(); }
+    else {
+      const moving = this.opts.getWalking() || (this.opts.getFrameMoving?.() ?? false);
+      const state = this.stillGate.update(moving);
+      if (state === 'prompt') { this.speak('How can I help?'); return; }
+      if (state === 'waiting') return; // narration paused until movement resumes
+      if (state === 'resumed') this.speak("You're moving again.");
+    }
     this.tickCount += 1;
     const r = await this.fetchScene('update');
     if (!this.narrating) return;
@@ -214,16 +231,24 @@ export class AssistantController {
     if (this.voice.isSpeaking()) return;
     const r = await this.fetchScene('find', st.target);
     if (!this.findState) return;
-    if (r?.say && !isDuplicate(st.lastGuidance, r.say)) {
-      st.lastGuidance = r.say;
-      this.speak(r.say);
-      // If scene says found (facts.found), stop. Server returns found in facts.
-      const found = (r.facts as { found?: boolean } | undefined)?.found;
-      if (found) { this.stopFinding(); return; }
-    } else if (!r?.say) {
-      const g = scanGuidance(this.findTurn++);
-      this.speak(g);
+    // The model verdict (facts.found) decides, not the wording: a direction
+    // sentence with found=false is a guess and must never be spoken as one.
+    const found = (r?.facts as { found?: boolean } | undefined)?.found ?? null;
+    const labels = this.opts.getDetections?.() ?? [];
+    const decision = decideFindTick({
+      target: st.target,
+      found,
+      detectorSees: matchesTarget(labels, st.target),
+      say: r?.say ?? '',
+      turn: this.findTurn,
+    });
+    if (decision.action === 'not-in-view') this.findTurn += 1;
+    if (decision.text && !isDuplicate(st.lastGuidance, decision.text)) {
+      st.lastGuidance = decision.text;
+      this.speak(decision.text);
     }
+    // Found: stop searching. Everything else keeps re-checking each tick.
+    if (decision.action === 'found') this.stopFinding();
   }
 
   /** UI buttons: run a tool and speak its answer directly (no Live round-trip). */
@@ -233,5 +258,5 @@ export class AssistantController {
   }
 
   interrupt(): void { this.voice.interrupt(); }
-  close(): void { this.stopNarration(); this.stopFinding(); this.voice.close(); }
+  close(): void { this.stopNarration(); this.stopFinding(); this.stillGate.reset(); this.voice.close(); }
 }

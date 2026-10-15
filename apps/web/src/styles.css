@@ -443,49 +443,25 @@ body {
   font-weight: 600;
 }
 
-/* ── Disclaimer screen ───────────────────────────────────── */
-.screen--disclaimer {
+/* ── Install card ────────────────────────────────────────── */
+.install {
   display: flex;
   flex-direction: column;
-  gap: 20px;
-  max-width: 640px;
-  margin: 0 auto;
-  padding: max(24px, env(safe-area-inset-top)) 20px
-    max(24px, env(safe-area-inset-bottom));
+  gap: 10px;
+  border-color: var(--accent);
 }
 
-.disclaimer__title {
+.install__text {
   margin: 0;
-  font-size: 2rem;
+  font-size: 1rem;
 }
 
-.disclaimer__lead {
-  font-size: 1.15rem;
-  margin: 0;
-}
-
-.disclaimer__list {
+.install__steps {
   margin: 0;
   padding-left: 1.2em;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-}
-
-.disclaimer__body {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 18px;
-  border: 2px solid var(--accent);
-  border-radius: var(--radius);
-  background: var(--surface);
-}
-
-.disclaimer__actions {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+  gap: 4px;
 }
 
 /* ── Voice menu (S2-9): same large touch targets as other actions. Status uses role=status in App.tsx. */

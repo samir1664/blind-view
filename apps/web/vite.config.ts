@@ -46,7 +46,10 @@ export default defineConfig({
         // NOT precached: forcing a 40 MB download before first use would make
         // the app feel broken on mobile data. They are cached on first use
         // instead, after which the terrain layer works offline too.
-        globIgnores: ['**/ort/**', '**/models/**'],
+        // Same for tasks-vision WASM (10.5-11.2 MB each): precaching them
+        // exceeds the 8 MB limit and breaks the production build. They
+        // are cached on first use via the runtimeCaching entry below.
+        globIgnores: ['**/ort/**', '**/models/**', '**/tasks-vision/**'],
         runtimeCaching: [
           {
             urlPattern: /^https:\/\/cdn\.jsdelivr\.net\/npm\/\@mediapipe\/tasks-vision\/.*/i,
@@ -64,6 +67,17 @@ export default defineConfig({
             handler: 'CacheFirst',
             options: {
               cacheName: 'depth-runtime',
+              expiration: { maxEntries: 10, maxAgeSeconds: 60 * 60 * 24 * 90 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+          {
+            // Local tasks-vision WASM (not precached, see globIgnores).
+            urlPattern: ({ url }: { url: URL }) =>
+              url.pathname.startsWith('/tasks-vision/'),
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'mediapipe-wasm-local',
               expiration: { maxEntries: 10, maxAgeSeconds: 60 * 60 * 24 * 90 },
               cacheableResponse: { statuses: [0, 200] },
             },

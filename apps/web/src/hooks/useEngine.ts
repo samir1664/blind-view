@@ -11,6 +11,8 @@ import { NarrationDirector } from '../lib/narration/director';
 import { listenOnce, parseCommand, VoiceInputError } from '../lib/speech/recognition';
 import { captureFrame } from '../lib/vision/capture';
 import { DepthEstimator } from '../lib/vision/depth';
+import { accelMagnitude, MotionTracker, StillnessGate } from '../lib/vision/motion';
+import type { StillnessResult } from '../lib/vision/motion';
 import { analyzePath } from '../lib/vision/freespace';
 import { explainUnusable, FrameScorer } from '../lib/vision/keyframe';
 import { toSpatial } from '../lib/vision/spatial';
@@ -76,6 +78,14 @@ const DEPTH_INTERVAL_MS = 900;
 const TERRAIN_STALE_MS = 2500;
 
 /**
+ * Motion sampling for the stillness gate. A 64×48 thumbnail every 500 ms
+ * is cheap, and it is a separate scorer so the narration keyframe scorer
+ * keeps its own rhythm. Change >= this = the camera is moving.
+ */
+const MOTION_SCORE_MS = 500;
+const FRAME_MOTION_THRESHOLD = 0.04;
+
+/**
  * TensorFlow.js is ~1.4 MB. Loading it eagerly would delay first paint for a
  * user who only wants to read the disclaimer or change a setting, so it is
  * pulled in on demand when a session actually starts.
@@ -119,6 +129,14 @@ export function useEngine() {
   const assistant = useRef<AssistantController | null>(null);
   const localEvents = useRef<string[]>([]);
   const walking = useRef(false);
+  // Motion-aware narration: step sensor + camera-frame change feed one gate.
+  const motionTracker = useRef<MotionTracker | null>(null);
+  const motionGate = useRef<StillnessGate | null>(null);
+  const motionScorer = useRef<FrameScorer | null>(null);
+  const motionMoving = useRef(false);
+  const lastMotionScoreAt = useRef(0);
+  const motionGateState = useRef<StillnessResult>('moving');
+  const motionCleanup = useRef<(() => void) | null>(null);
 
   // ── Speaking helper ─────────────────────────────────────────
   useEffect(() => {
@@ -483,9 +501,44 @@ export function useEngine() {
         });
     }
 
-    // Tier 2 — cloud narration.
+    // Motion — feeds the stillness gate (moving = narrate, still = ask once).
+    // Sampled at 2 Hz so the gate sees real movement, not per-frame noise.
+    // Never prompts while a Find / question is in progress: the gate resets
+    // instead, so the still clock restarts after the interaction.
+    if (now - lastMotionScoreAt.current >= MOTION_SCORE_MS) {
+      lastMotionScoreAt.current = now;
+      // Only user-driven work resets the still clock (a question / Find).
+      // A background place check must not resume narration while standing still.
+      const busy =
+        narrationPending.current ||
+        assistant.current?.isFinding === true;
+      if (busy) {
+        motionGate.current?.reset(now);
+        motionGateState.current = 'moving';
+      } else if (motionGate.current && motionScorer.current) {
+        const score = motionScorer.current.score(video);
+        const frameMoving =
+          score !== null && score.change >= FRAME_MOTION_THRESHOLD;
+        motionMoving.current = frameMoving || walking.current;
+        motionGateState.current = motionGate.current.update(motionMoving.current, now);
+      }
+    }
+
+    // Tier 2 — cloud narration, paused while the user stands still.
+    if (motionGateState.current === 'prompt') {
+      // Asked once per still period (gate guarantees it). Narration stays
+      // paused until movement resumes; the mic stays listening for commands.
+      motionGateState.current = 'waiting';
+      say('How can I help?', Priority.ALERT, 'system');
+    } else if (motionGateState.current === 'resumed') {
+      motionGateState.current = 'moving';
+      say("You're moving again.", Priority.INFO, 'system');
+      // Fresh place-first update on the next pass below.
+      lastNarrationAt.current = 0;
+    }
     if (
       settings.narrationEnabled &&
+      motionGateState.current !== 'waiting' &&
       !narrationPending.current &&
       now >= narrationBlockedUntil.current &&
       now - lastNarrationAt.current >= settings.narrationIntervalMs
@@ -549,8 +602,43 @@ export function useEngine() {
   }, [runNarration, runPlaceCheck, say]);
 
   // ── Lifecycle ───────────────────────────────────────────────
+  /**
+   * Step sensor for walking detection. DeviceMotion alone is never required:
+   * camera-frame change is the primary motion signal, and any failure here
+   * (no sensor, no permission, private mode) is silently ignored.
+   * Fire-and-forget: must run in the tap gesture on iOS to get permission.
+   */
+  const setupMotionSensor = useCallback(() => {
+    try {
+      if (typeof window === 'undefined' || !('DeviceMotionEvent' in window)) return;
+      const tracker = new MotionTracker();
+      motionTracker.current = tracker;
+      const onMotion = (e: DeviceMotionEvent) => {
+        try {
+          const a = e.accelerationIncludingGravity;
+          if (!a || a.x == null || a.y == null || a.z == null) return;
+          walking.current = tracker.update(accelMagnitude(a.x, a.y, a.z)) === 'walking';
+        } catch { /* a bad sensor sample never breaks the app */ }
+      };
+      const attach = () => {
+        window.addEventListener('devicemotion', onMotion);
+        motionCleanup.current = () => window.removeEventListener('devicemotion', onMotion);
+      };
+      const DM = window.DeviceMotionEvent as unknown as {
+        requestPermission?: () => Promise<string>;
+      };
+      if (typeof DM.requestPermission === 'function') {
+        void DM.requestPermission().then((r) => { if (r === 'granted') attach(); }).catch(() => undefined);
+      } else {
+        attach();
+      }
+    } catch { /* no motion sensor: camera-frame motion still works */ }
+  }, []);
+
   const start = useCallback(async () => {
     if (running.current) return;
+    // Runs in the tap gesture (needed for iOS motion permission).
+    setupMotionSensor();
 
     const session = useSession.getState();
     const settings = useSettings.getState();
@@ -589,6 +677,13 @@ export function useEngine() {
         minGapMs: settings.calloutGapMs,
       });
       scorer.current = new FrameScorer();
+      // Fresh motion state per session: still clock starts when they start moving.
+      motionTracker.current?.reset();
+      motionGate.current = new StillnessGate();
+      motionScorer.current = new FrameScorer();
+      motionMoving.current = false;
+      motionGateState.current = 'moving';
+      lastMotionScoreAt.current = 0;
       depth.current ??= new DepthEstimator();
       terrain.current = null;
       terrainAt.current = 0;
@@ -624,7 +719,7 @@ export function useEngine() {
       stopStream(stream.current);
       stream.current = null;
     }
-  }, [say, tick]);
+  }, [say, tick, setupMotionSensor]);
 
   const stop = useCallback(() => {
     running.current = false;
@@ -645,6 +740,19 @@ export function useEngine() {
 
     voiceCancel.current?.();
     voiceCancel.current = null;
+
+    // Stop cancels everything, including a Find loop in the assistant.
+    assistant.current?.close();
+    assistant.current = null;
+
+    // Motion sensor off, stillness gate reset, walking state cleared.
+    motionCleanup.current?.();
+    motionCleanup.current = null;
+    motionTracker.current?.reset();
+    motionGate.current?.reset();
+    motionGateState.current = 'moving';
+    motionMoving.current = false;
+    walking.current = false;
 
     stopStream(stream.current);
     stream.current = null;
@@ -732,9 +840,13 @@ export function useEngine() {
       if (rafId.current !== null) cancelAnimationFrame(rafId.current);
       narrationAbort.current?.abort();
       placeAbort.current?.abort();
+      motionCleanup.current?.();
+      motionCleanup.current = null;
+      assistant.current?.close();
+      assistant.current = null;
       depth.current?.dispose();
       stopStream(stream.current);
-      audioEngine.dispose();
+      audioEngine.dispose(); 
     },
     [],
   );
@@ -745,6 +857,8 @@ export function useEngine() {
       voice,
       getFrame: () => (videoRef.current ? captureFrame(videoRef.current) : null),
       getWalking: () => walking.current,
+      getDetections: () => [...lastLabels.current],
+      getFrameMoving: () => motionMoving.current,
       isMirrored: () => useSettings.getState().cameraFacing === 'user',
       getLocalEvents: () => [...localEvents.current],
       onCameraChange: (which) => {
